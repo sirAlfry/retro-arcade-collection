@@ -2,6 +2,7 @@
 
 > Una raccolta di 9 minigiochi arcade classici, realizzati in Python con Pygame-CE, con launcher unificato in stile retro CRT.
 
+![Retro Arcade Collection - 9 minigiochi arcade in Python](assets/retro_arcade_collection.png)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)
 ![Pygame-CE](https://img.shields.io/badge/Pygame--CE-2.4+-1A1A1A?style=flat&logo=pygame&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
