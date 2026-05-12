@@ -1,0 +1,66 @@
+# =============================================================================
+# Retro Arcade Collection — .gitignore
+# =============================================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+
+# PyInstaller (i .spec li versioniamo, le build no)
+*.manifest
+*.exe
+*.app
+*.dmg
+# Le build sono in build/ e dist/, già escluse sopra
+# Manteniamo i .spec dentro la cartella build/ (ma non i risultati di build)
+!build/*.spec
+
+# --- Virtual environments ---
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# --- Runtime / generati ---
+scores.json
+*.log
+*.bak
+*.bak_*
+
+# Backup creati dai tool clean_nulls / fix_encoding
+*.bak_[0-9]*
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- OS-specific ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Configurazione locale (eventuale) ---
+.env
+config.local.*

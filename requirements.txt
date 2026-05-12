@@ -1,0 +1,7 @@
+# Retro Arcade Collection — dipendenze runtime
+
+# Game engine
+pygame-ce>=2.4.0
+
+# Build (opzionale, solo per creare eseguibili)
+# pyinstaller>=6.0.0
