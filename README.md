@@ -134,14 +134,6 @@ Per i dettagli completi su design, scelte tecniche e roadmap: vedi [docs/GDD_ret
 - **Build**: PyInstaller
 - **Persistenza**: JSON
 
-## 🗺️ Roadmap
-
-- [ ] Aggiungere screenshot e GIF dei giochi nel README
-- [ ] Audio: musiche di sottofondo e SFX per ogni gioco
-- [ ] Leaderboard online opzionale
-- [ ] Supporto controller/gamepad
-- [ ] Localizzazione (EN/IT)
-
 ## 👤 Autore
 
 **Alfredo De Donno** — Full-Stack Developer & Game Dev
