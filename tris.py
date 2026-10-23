@@ -1,304 +1,322 @@
 # tris.py
 """
-Tic Tac Toe - Improved version with timer-based AI thinking, winning line animation, and score tracking.
-"""
-import pygame
-import random
-from typing import Callable, Optional, List, Tuple
-from game_ai import GameAI, TicTacToeState
-from game_shared import safe_font, BG
+Tic Tac Toe (Tris) - against a friend or against the computer.
 
-W, H = 800, 600
+* Modes: vs CPU (easy / medium / impossible) or 2 players.
+  The old "1P" mode was identical to "2P"; it has been removed.
+* The "impossible" CPU uses full-depth minimax with a transposition table
+  (see ``game_ai.py``): it never loses - an exhaustive test proves it.
+* Who starts alternates every round, so the CPU also gets to open.
+* Neon marks drawn with an animated stroke, animated winning line,
+  hover preview, keyboard cursor (arrows + ENTER).
+* Wins/draws are saved (``tris_x``, ``tris_o``, ``tris_draw``).
+"""
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+
+import pygame
+
+import game_shared as gs
+import sfx
+from game_ai import GameAI, TicTacToeState
+from pixel_font import blit_pixel_text
+
+W, H = gs.W, gs.H
+CELL = 150
+BOARD = CELL * 3
+OFF_X = (W - BOARD) // 2
+OFF_Y = 52
+CPU_DELAY = 0.45
+STROKE_TIME = 0.18
 
 COMMANDS = [
-    "Clicca per posizionare X/O",
-    "TAB: cambia modalità (1P / 2P / VS AI)",
-    "R: Ricomincia | ESC: Menu"
+    "Clic o frecce + INVIO: piazza il segno",
+    "TAB: CPU / 2 giocatori   1-2-3: difficoltà CPU",
 ]
+
+LEVELS = ("easy", "medium", "hard")
+LEVEL_NAMES = {"easy": "FACILE", "medium": "MEDIO", "hard": "IMPOSSIBILE"}
+MODES = ("VS CPU · FACILE", "VS CPU · MEDIO", "VS CPU · IMPOSSIBILE", "2 GIOCATORI")
+
+def winning_line(board: list[list[int | None]]) -> list[tuple[int, int]] | None:
+    """Return the three (row, col) cells of a winning line, if any."""
+    lines = [[(r, 0), (r, 1), (r, 2)] for r in range(3)]
+    lines += [[(0, c), (1, c), (2, c)] for c in range(3)]
+    lines += [[(0, 0), (1, 1), (2, 2)], [(0, 2), (1, 1), (2, 0)]]
+    for line in lines:
+        a, b, c = (board[r][col] for r, col in line)
+        if a is not None and a == b == c:
+            return line
+    return None
 
 
 def difficulty_label(d: int) -> str:
-    """Get difficulty label for AI difficulty level.
+    """Backwards-compatible helper used by older code."""
+    return "FACILE" if d <= 1 else ("MEDIO" if d <= 3 else "DIFFICILE")
 
-    Args:
-        d: Difficulty value.
+
+def cell_rect(r: int, c: int) -> pygame.Rect:
+    return pygame.Rect(OFF_X + c * CELL, OFF_Y + r * CELL, CELL, CELL)
+
+
+def draw_mark(screen: pygame.Surface, mark: int, rect: pygame.Rect, progress: float,
+              alpha: int = 255) -> None:
+    """Draw an X (1) or an O (-1) with an animated neon stroke."""
+    progress = max(0.0, min(1.0, progress))
+    layer = pygame.Surface(rect.size, pygame.SRCALPHA)
+    inner = layer.get_rect().inflate(-int(CELL * 0.42), -int(CELL * 0.42))
+    if mark == 1:
+        color = gs.NEON_RED
+        segments = [(inner.topleft, inner.bottomright), (inner.topright, inner.bottomleft)]
+        for k, (a, b) in enumerate(segments):
+            p = max(0.0, min(1.0, progress * 2 - k))
+            if p <= 0:
+                continue
+            end = (a[0] + (b[0] - a[0]) * p, a[1] + (b[1] - a[1]) * p)
+            pygame.draw.line(layer, (*color, alpha // 4), a, end, 22)
+            pygame.draw.line(layer, (*color, alpha), a, end, 10)
+    else:
+        color = gs.NEON_BLUE
+        radius = inner.w // 2 + 4
+        center = layer.get_rect().center
+        if progress >= 1:
+            pygame.draw.circle(layer, (*color, alpha // 4), center, radius + 6, 20)
+            pygame.draw.circle(layer, (*color, alpha), center, radius, 10)
+        else:
+            box = pygame.Rect(0, 0, radius * 2, radius * 2)
+            box.center = center
+            start = math.pi / 2
+            pygame.draw.arc(layer, (*color, alpha // 4), box.inflate(12, 12), start,
+                            start + progress * math.tau, 20)
+            pygame.draw.arc(layer, (*color, alpha), box, start, start + progress * math.tau, 10)
+    screen.blit(layer, rect)
+
+
+def main(load_scores: Callable[[], dict] | None = None,
+         save_scores: Callable[[dict], None] | None = None) -> str:
+    """
+    Play Tic Tac Toe.
 
     Returns:
-        str: Human-readable difficulty label.
+        ``"menu"`` or ``"quit"``.
     """
-    if d <= 1:
-        return "FACILE"
-    if d <= 3:
-        return "MEDIO"
-    return "DIFFICILE"
+    load_scores, save_scores = gs.ensure_scores(load_scores, save_scores)
+    screen = gs.setup_screen("Tic Tac Toe")
+    clock = gs.GameClock(60)
+    choice = gs.select_menu(screen, "TIC TAC TOE", MODES, ["X sei tu, O è la CPU o il tuo amico"],
+                            default=1)
+    if isinstance(choice, str):
+        return choice
+    vs_cpu = choice < 3
+    level = LEVELS[min(choice, 2)] if vs_cpu else "medium"
+    ai = GameAI.for_level(level, player_id=-1)
 
+    data = load_scores()
+    tally = {"x": int(data.get("tris_x", 0)), "o": int(data.get("tris_o", 0)),
+             "draw": int(data.get("tris_draw", 0))}
+    particles = gs.Particles()
+    state = {
+        "board": [[None] * 3 for _ in range(3)],
+        "turn": 1, "starter": 1, "winner": None, "line": None, "over": False,
+        "cpu_timer": 0.0, "placed": {}, "line_t": 0.0, "cursor": (1, 1), "hover": None,
+    }
+    t = 0.0
 
-def tris_game(load_scores: Callable, save_scores: Callable) -> str:
-    """Tic Tac Toe game with AI opponent and score tracking.
+    def new_round(alternate: bool = True) -> None:
+        if alternate:
+            state["starter"] = -state["starter"]
+        state.update(board=[[None] * 3 for _ in range(3)], turn=state["starter"], winner=None,
+                     line=None, over=False, cpu_timer=CPU_DELAY, placed={}, line_t=0.0)
 
-    Args:
-        load_scores: Function to load game scores.
-        save_scores: Function to save game scores.
+    def place(r: int, c: int) -> bool:
+        board = state["board"]
+        if state["over"] or board[r][c] is not None:
+            return False
+        mark = state["turn"]
+        board[r][c] = mark
+        state["placed"][(r, c)] = t
+        sfx.play("place_x" if mark == 1 else "place_o")
+        line = winning_line(board)
+        if line:
+            state.update(winner=mark, line=line, over=True, line_t=t)
+        elif all(v is not None for row in board for v in row):
+            state.update(winner=0, over=True, line_t=t)
+        else:
+            state["turn"] = -mark
+            state["cpu_timer"] = CPU_DELAY
+            return True
+        # round finished: update and persist the tally
+        key = {1: "x", -1: "o", 0: "draw"}[state["winner"]]
+        tally[key] += 1
+        save_scores({"tris_x": tally["x"], "tris_o": tally["o"], "tris_draw": tally["draw"]})
+        if state["winner"] == 0:
+            sfx.play("blip")
+        elif vs_cpu and state["winner"] == -1:
+            sfx.play("lose")
+        else:
+            sfx.play("win")
+            for rr, cc in line or []:
+                rect = cell_rect(rr, cc)
+                particles.burst(rect.centerx, rect.centery,
+                                (gs.NEON_RED if mark == 1 else gs.NEON_BLUE, gs.WHITE), 20,
+                                speed=(60, 260), life=(0.4, 1.0))
+        return True
 
-    Returns:
-        str: Game state command ("menu", "quit", etc.)
-    """
-    pygame.init()
-    screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Tic Tac Toe")
-    clock = pygame.time.Clock()
+    def human_turn() -> bool:
+        return not state["over"] and (not vs_cpu or state["turn"] == 1)
 
-    title_font = safe_font("consolas", 28)
-    small_font = safe_font("consolas", 18)
-
-    mode: str = "1P"
-    ai_difficulty: int = 3
-    ai = GameAI("minimax", difficulty=ai_difficulty, player_id=-1)
-
-    # Score tracking
-    scores_data: dict = load_scores()
-    x_wins: int = scores_data.get("tris_x", 0)
-    o_wins: int = scores_data.get("tris_o", 0)
-    draws: int = scores_data.get("tris_draw", 0)
-
-    # AI thinking timer
-    ai_thinking: bool = False
-    ai_think_start: int = 0
-    ai_think_duration: int = 800  # milliseconds
-
-    # Winning line animation
-    winning_line: Optional[List[Tuple[int, int]]] = None
-    winning_line_time: int = 0
-
-    def draw_board(board: List[List[Optional[int]]], turn: int) -> None:
-        """Draw the game board and UI.
-
-        Args:
-            board: 3x3 board state.
-            turn: Current player (1 for X, -1 for O).
-        """
-        screen.fill(BG)
-        margin: int = 160
-        size: int = 480
-        cell: int = size // 3
-
-        # Draw grid
-        for i in range(1, 3):
-            pygame.draw.line(screen, (100, 120, 160), (margin + i * cell, margin),
-                           (margin + i * cell, margin + size), 6)
-            pygame.draw.line(screen, (100, 120, 160), (margin, margin + i * cell),
-                           (margin + size, margin + i * cell), 6)
-
-        # Draw X and O
-        f = safe_font("consolas", 56, bold=True)
+    def draw() -> None:
+        screen.fill(gs.BG)
+        # scoreboard
+        left = "X (TU)" if vs_cpu else "X (G1)"
+        right = f"O (CPU {LEVEL_NAMES[level]})" if vs_cpu else "O (G2)"
+        blit_pixel_text(screen, f"{left}  {tally['x']}", (16, 22), 2, gs.NEON_RED, "midleft")
+        blit_pixel_text(screen, f"PARI {tally['draw']}", (W // 2, 22), 2, gs.TEXT_DIM, "center")
+        blit_pixel_text(screen, f"{tally['o']}  {right}", (W - 16, 22), 2, gs.NEON_BLUE, "midright")
+        # grid
+        for i in (1, 2):
+            x = OFF_X + i * CELL
+            y = OFF_Y + i * CELL
+            for color, width in (((40, 60, 120), 14), (gs.NEON_PURPLE, 5)):
+                pygame.draw.line(screen, color, (x, OFF_Y + 8), (x, OFF_Y + BOARD - 8), width)
+                pygame.draw.line(screen, color, (OFF_X + 8, y), (OFF_X + BOARD - 8, y), width)
+        board = state["board"]
+        winning = set(state["line"] or [])
         for r in range(3):
             for c in range(3):
-                val = board[r][c]
-                if val is None:
+                mark = board[r][c]
+                rect = cell_rect(r, c)
+                if mark is None:
                     continue
-                ch = "X" if val == 1 else "O"
-                txt = f.render(ch, True, (230, 50, 50) if ch == "X" else (90, 140, 255))
-                pos = (margin + c * cell + cell // 2 - txt.get_width() // 2,
-                      margin + r * cell + cell // 2 - txt.get_height() // 2)
-                screen.blit(txt, pos)
-
-        # Draw winning line if exists
-        if winning_line:
-            elapsed = pygame.time.get_ticks() - winning_line_time
-            if elapsed < 1500:  # Show animation for 1.5 seconds
-                alpha = int(255 * (1 - elapsed / 1500.0))  # Fade out
-                line_surface = pygame.Surface((W, H), pygame.SRCALPHA)
-                if len(winning_line) == 2:
-                    x1 = margin + winning_line[0][1] * cell + cell // 2
-                    y1 = margin + winning_line[0][0] * cell + cell // 2
-                    x2 = margin + winning_line[1][1] * cell + cell // 2
-                    y2 = margin + winning_line[1][0] * cell + cell // 2
-                    pygame.draw.line(line_surface, (255, 255, 0, alpha), (x1, y1), (x2, y2), 8)
-                screen.blit(line_surface, (0, 0))
-
-        # Draw AI thinking indicator
-        if ai_thinking:
-            elapsed = pygame.time.get_ticks() - ai_think_start
-            if elapsed < ai_think_duration:
-                dots = int((elapsed / ai_think_duration) * 3) + 1
-                thinking = small_font.render("AI thinking" + "." * dots, True, (200, 150, 80))
-                screen.blit(thinking, (W // 2 - thinking.get_width() // 2, 520))
-
-        # Draw status
-        status = f"Turno: {'X' if turn == 1 else 'O'}  |  Modalità: {mode}  |  AI: {difficulty_label(ai_difficulty)}"
-        st = small_font.render(status, True, (220, 220, 220))
-        screen.blit(st, (W // 2 - st.get_width() // 2, 40))
-
-        # Draw score
-        score_text = f"X:{x_wins}  O:{o_wins}  DRAW:{draws}"
-        score = small_font.render(score_text, True, (180, 220, 180))
-        screen.blit(score, (10, 10))
-
-        pygame.display.flip()
-
-    board: List[List[Optional[int]]] = [[None] * 3 for _ in range(3)]
-    turn: int = 1
-    winner: Optional[int] = None
-
-    def reset() -> None:
-        """Reset the game state."""
-        nonlocal board, turn, winner, winning_line
-        board = [[None] * 3 for _ in range(3)]
-        turn = 1
-        winner = None
-        winning_line = None
-
-    reset()
-
-    def check_winner() -> Optional[int]:
-        """Check for a winner or draw.
-
-        Returns:
-            Optional[int]: 1 for X win, -1 for O win, 0 for draw, None for ongoing.
-        """
-        # Check rows
-        for i in range(3):
-            if board[i][0] == board[i][1] == board[i][2] and board[i][0] is not None:
-                nonlocal winning_line
-                winning_line = [(i, 0), (i, 2)]
-                return board[i][0]
-
-        # Check columns
-        for j in range(3):
-            if board[0][j] == board[1][j] == board[2][j] and board[0][j] is not None:
-                winning_line = [(0, j), (2, j)]
-                return board[0][j]
-
-        # Check diagonals
-        if board[0][0] == board[1][1] == board[2][2] and board[0][0] is not None:
-            winning_line = [(0, 0), (2, 2)]
-            return board[0][0]
-        if board[0][2] == board[1][1] == board[2][0] and board[0][2] is not None:
-            winning_line = [(0, 2), (2, 0)]
-            return board[0][2]
-
-        # Check draw
-        if all(all(cell is not None for cell in row) for row in board):
-            return 0
-
-        return None
-
-    running: bool = True
-    while running:
-        clock.tick(60)
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                return "menu"
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    from game_shared import in_game_menu
-                    choice = in_game_menu(screen, "Tic Tac Toe", COMMANDS, title_font, small_font)
-                    if choice == "menu":
-                        return "menu"
-                    elif choice == "quit":
-                        pygame.quit()
-                        return "quit"
-                    elif choice == "restart":
-                        reset()
-                        continue
-                if event.key == pygame.K_r:
-                    reset()
-                if event.key == pygame.K_TAB:
-                    if mode == "1P":
-                        mode = "2P"
-                    elif mode == "2P":
-                        mode = "VS AI"
-                    else:
-                        mode = "1P"
-                if event.key == pygame.K_1:
-                    ai_difficulty = 1
-                    ai.difficulty = ai_difficulty
-                if event.key == pygame.K_2:
-                    ai_difficulty = 3
-                    ai.difficulty = ai_difficulty
-                if event.key == pygame.K_3:
-                    ai_difficulty = 6
-                    ai.difficulty = ai_difficulty
-
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if winner is not None:
-                    continue
-                mx, my = event.pos
-                margin: int = 160
-                size: int = 480
-                cell: int = size // 3
-                if margin <= mx <= margin + size and margin <= my <= margin + size:
-                    c = (mx - margin) // cell
-                    r = (my - margin) // cell
-                    if board[r][c] is None:
-                        if mode == "VS AI":
-                            if turn == 1:
-                                board[r][c] = 1
-                                turn = -1
-                                ai_thinking = True
-                                ai_think_start = pygame.time.get_ticks()
-                        else:
-                            board[r][c] = turn
-                            turn = -turn
-
-        # AI move with timer instead of blocking sleep
-        if winner is None and mode == "VS AI" and turn == -1:
-            elapsed = pygame.time.get_ticks() - ai_think_start if ai_thinking else 0
-            if ai_thinking and elapsed >= ai_think_duration:
-                ai_thinking = False
-                try:
-                    state = TicTacToeState(board, current_player=turn)
-                    ai.player_id = -1
-                    best = ai.get_best_move(state)
-                    if best is not None:
-                        board = state.make_move(best).board
-                        turn = 1
-                except Exception:
-                    empties = [(r, c) for r in range(3) for c in range(3) if board[r][c] is None]
-                    if empties:
-                        r, c = random.choice(empties)
-                        board[r][c] = -1
-                        turn = 1
-
-        winner = check_winner()
-        draw_board(board, turn)
-
-        if winner is not None:
-            if winner == 1:
-                res = "X WIN"
-                x_wins += 1
-            elif winner == -1:
-                res = "O WIN"
-                o_wins += 1
+                if (r, c) in winning:
+                    pulse = 0.5 + 0.5 * math.sin(t * 8)
+                    glow = pygame.Surface(rect.size, pygame.SRCALPHA)
+                    pygame.draw.rect(glow, (255, 230, 60, int(40 + 50 * pulse)),
+                                     glow.get_rect().inflate(-10, -10), border_radius=16)
+                    screen.blit(glow, rect)
+                progress = (t - state["placed"].get((r, c), -1)) / STROKE_TIME
+                draw_mark(screen, mark, rect, progress)
+        # hover preview / keyboard cursor
+        if human_turn():
+            target = state["hover"] or state["cursor"]
+            r, c = target
+            if board[r][c] is None:
+                draw_mark(screen, state["turn"], cell_rect(r, c), 1.0, alpha=70)
+            pygame.draw.rect(screen, gs.NEON_YELLOW, cell_rect(*state["cursor"]).inflate(-14, -14), 2,
+                             border_radius=12)
+        # winning line
+        if state["line"]:
+            a = cell_rect(*state["line"][0]).center
+            b = cell_rect(*state["line"][2]).center
+            p = min(1.0, (t - state["line_t"]) / 0.35)
+            end = (a[0] + (b[0] - a[0]) * p, a[1] + (b[1] - a[1]) * p)
+            pygame.draw.line(screen, (255, 230, 60), a, end, 18)
+            pygame.draw.line(screen, gs.WHITE, a, end, 6)
+        particles.draw(screen)
+        # status line
+        if state["over"]:
+            winner = state["winner"]
+            if winner == 0:
+                text, color = "PAREGGIO!", gs.NEON_YELLOW
+            elif vs_cpu and winner == 1:
+                text, color = "HAI VINTO!", gs.NEON_GREEN
+            elif vs_cpu:
+                text, color = "VINCE LA CPU!", gs.NEON_MAGENTA
             else:
-                res = "DRAW"
-                draws += 1
+                text, color = ("VINCE X!", gs.NEON_RED) if winner == 1 else ("VINCE O!", gs.NEON_BLUE)
+            box = pygame.Rect(0, 0, 520, 64)
+            box.midbottom = (W // 2, H - 6)
+            gs.draw_panel(screen, box, color, fill_alpha=230)
+            blit_pixel_text(screen, text, (W // 2, box.y + 20), 3, color, "center")
+            blit_pixel_text(screen, "INVIO / CLIC: NUOVA PARTITA   ESC: PAUSA", (W // 2, box.y + 46), 1,
+                            gs.TEXT_DIM, "center")
+        else:
+            if vs_cpu and state["turn"] == -1:
+                dots = "." * (1 + int(t * 4) % 3)
+                msg, color = f"LA CPU STA PENSANDO{dots}", gs.NEON_BLUE
+            else:
+                who = "X" if state["turn"] == 1 else "O"
+                msg = f"TOCCA A {who}" if not vs_cpu else "TOCCA A TE (X)"
+                color = gs.NEON_RED if state["turn"] == 1 else gs.NEON_BLUE
+            blit_pixel_text(screen, msg, (W // 2, H - 22), 2, color, "center")
 
-            # Save scores
-            scores_data["tris_x"] = x_wins
-            scores_data["tris_o"] = o_wins
-            scores_data["tris_draw"] = draws
-            save_scores(scores_data)
+    new_round(alternate=False)
+    while True:
+        dt = clock.tick()
+        t += dt
+        for e in pygame.event.get():
+            if gs.handle_global_event(e):
+                continue
+            if e.type == pygame.QUIT:
+                return "quit"
+            if e.type == pygame.KEYDOWN:
+                if e.key in (pygame.K_ESCAPE, pygame.K_p):
+                    choice = gs.in_game_menu(screen, "Tic Tac Toe", COMMANDS)
+                    clock.reset()
+                    if choice in ("menu", "quit"):
+                        return choice
+                    if choice == "restart":
+                        new_round(alternate=False)
+                elif e.key == pygame.K_r:
+                    new_round(alternate=False)
+                elif e.key == pygame.K_TAB:
+                    vs_cpu = not vs_cpu
+                    gs.notify("MODALITÀ: VS CPU" if vs_cpu else "MODALITÀ: 2 GIOCATORI")
+                    new_round(alternate=False)
+                elif e.key in (pygame.K_1, pygame.K_2, pygame.K_3):
+                    level = LEVELS[e.key - pygame.K_1]
+                    ai = GameAI.for_level(level, player_id=-1)
+                    gs.notify(f"CPU: {LEVEL_NAMES[level]}")
+                elif state["over"] and e.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER):
+                    new_round()
+                elif e.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
+                               pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d):
+                    dr = {pygame.K_UP: -1, pygame.K_w: -1, pygame.K_DOWN: 1, pygame.K_s: 1}.get(e.key, 0)
+                    dc = {pygame.K_LEFT: -1, pygame.K_a: -1, pygame.K_RIGHT: 1, pygame.K_d: 1}.get(e.key, 0)
+                    r, c = state["cursor"]
+                    state["cursor"] = ((r + dr) % 3, (c + dc) % 3)
+                    state["hover"] = None
+                elif e.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER) and human_turn():
+                    place(*state["cursor"])
+            elif e.type == pygame.MOUSEMOTION:
+                state["hover"] = None
+                for r in range(3):
+                    for c in range(3):
+                        if cell_rect(r, c).collidepoint(e.pos):
+                            state["hover"] = (r, c)
+                            state["cursor"] = (r, c)
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                if state["over"]:
+                    new_round()
+                    continue
+                if not human_turn():
+                    continue
+                for r in range(3):
+                    for c in range(3):
+                        if cell_rect(r, c).collidepoint(e.pos):
+                            place(r, c)
 
-            pygame.time.delay(600)
-            screen.fill(BG)
-            tx = title_font.render(res, True, (240, 200, 80))
-            screen.blit(tx, (W // 2 - tx.get_width() // 2, H // 2 - 20))
-            prompt = small_font.render("R: ricomincia  |  ESC: menu", True, (220, 220, 220))
-            screen.blit(prompt, (W // 2 - prompt.get_width() // 2, H // 2 + 30))
-            pygame.display.flip()
+        # CPU move after a short, non-blocking "thinking" pause
+        if vs_cpu and not state["over"] and state["turn"] == -1:
+            state["cpu_timer"] -= dt
+            if state["cpu_timer"] <= 0:
+                move = ai.get_best_move(TicTacToeState(state["board"], current_player=-1))
+                if move is not None:
+                    place(*move)
+                clock.reset()
 
-            waiting: bool = True
-            while waiting:
-                for ev in pygame.event.get():
-                    if ev.type == pygame.QUIT:
-                        return "menu"
-                    if ev.type == pygame.KEYDOWN:
-                        if ev.key == pygame.K_r:
-                            reset()
-                            waiting = False
-                        if ev.key == pygame.K_ESCAPE:
-                            return "menu"
+        particles.update(dt)
+        draw()
+        gs.present(screen)
 
-    return "menu"
+
+def tris_game(load_scores: Callable[[], dict], save_scores: Callable[[dict], None]) -> str:
+    """Backwards-compatible entry point (old launcher signature)."""
+    return main(load_scores, save_scores)
+
+
+if __name__ == "__main__":
+    main()
+    gs.shutdown()

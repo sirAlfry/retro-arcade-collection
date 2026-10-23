@@ -10,14 +10,13 @@ Ripulisce file convertendo in UTF-8:
 Opzioni:
   --file <path>    : un singolo file da processare (default: game_shared.py)
   --all / -a       : processa tutti i .py nella cartella (non ricorsivo)
-  --backup / -b    : crea backup <file>.bak_TIMESTAMP
+  --no-backup      : non crea il backup <file>.bak_TIMESTAMP (creato di default)
   --dry-run / -n   : non modifica nulla
 """
-from pathlib import Path
 import argparse
 from datetime import datetime
-import sys
-import os
+from pathlib import Path
+
 
 def fix_utf8(path: Path, make_backup: bool = True, dry_run: bool = False):
     try:
@@ -50,8 +49,10 @@ def fix_utf8(path: Path, make_backup: bool = True, dry_run: bool = False):
 def main():
     parser = argparse.ArgumentParser(description="Fix file encoding -> UTF-8")
     parser.add_argument("--file", "-f", help="Singolo file da processare")
-    parser.add_argument("--all", "-a", action="store_true", help="Processa tutti i .py nella cartella (non ricorsivo)")
-    parser.add_argument("--backup", "-b", action="store_true", default=True, help="Crea backup dei file modificati")
+    parser.add_argument("--all", "-a", action="store_true",
+                        help="Processa tutti i .py nella cartella (non ricorsivo)")
+    parser.add_argument("--no-backup", dest="backup", action="store_false",
+                        help="Non creare il backup <file>.bak_TIMESTAMP (di default viene creato)")
     parser.add_argument("--dry-run", "-n", action="store_true", help="Non scrive i file")
     args = parser.parse_args()
 

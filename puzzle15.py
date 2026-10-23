@@ -1,271 +1,281 @@
 # puzzle15.py
 """
-Puzzle 15 - Improved version with move counter, timer, tile animation, and congratulations screen.
-"""
-import pygame
-import random
-from typing import List, Tuple, Optional
-from game_shared import safe_font, BG
+Puzzle 15 - the classic sliding puzzle (Sam Loyd's "Gem Puzzle").
 
-W, H = 800, 600
+Bug fixed: the first version used the wrong parity test, so **every**
+shuffled board was mathematically unsolvable. The rule for a 4x4 board is:
+
+    solvable  <=>  (inversions + row of the blank counted from the bottom) is odd
+
+New features:
+    * click any tile in the blank's row/column to slide the whole line at once
+    * arrow keys push a tile into the gap (tile moves in the arrow direction)
+    * smooth sliding animation for every tile
+    * tiles glow when they sit in their final position; colours by target row
+    * best moves and best time are saved
+"""
+from __future__ import annotations
+
+import random
+from collections.abc import Callable
+
+import pygame
+
+import game_shared as gs
+import sfx
+from pixel_font import blit_pixel_text
+from scores import get_best, record_best
+
+W, H = gs.W, gs.H
+HUD_H = 44
+SIZE = 4
+TILE = 110
+GAP = 8
+BOARD_PX = SIZE * TILE + (SIZE - 1) * GAP
+OFF_X = (W - BOARD_PX) // 2
+OFF_Y = HUD_H + (H - HUD_H - BOARD_PX) // 2
+ROW_COLORS = (gs.NEON_CYAN, gs.NEON_MAGENTA, gs.NEON_YELLOW, gs.NEON_GREEN)
+SOLVED = list(range(1, SIZE * SIZE)) + [0]
 
 COMMANDS = [
-    "Clicca su una tessera adiacente per muoverla",
-    "Usa frecce per muovere il buco",
-    "ESC: menu"
+    "Clic su una tessera nella riga/colonna del buco",
+    "Frecce: spingi una tessera nel buco   R: rimescola",
 ]
 
 
+# ============================================================================
+# Pure puzzle logic (unit-tested)
+# ============================================================================
+
+def inversions(tiles: list[int]) -> int:
+    """Number of pairs (a, b) with a before b but a > b, ignoring the blank (0)."""
+    nums = [t for t in tiles if t]
+    return sum(1 for i in range(len(nums)) for j in range(i + 1, len(nums)) if nums[i] > nums[j])
+
+
+def is_solvable(tiles: list[int], size: int = SIZE) -> bool:
+    """
+    Parity test for an N x N sliding puzzle (0 = blank).
+
+    * odd width: solvable iff the number of inversions is even;
+    * even width: solvable iff inversions + (blank row counted from the
+      bottom, starting at 1) is odd.
+    """
+    inv = inversions(tiles)
+    if size % 2 == 1:
+        return inv % 2 == 0
+    blank_row_from_bottom = size - tiles.index(0) // size
+    return (inv + blank_row_from_bottom) % 2 == 1
+
+
+def is_solved(tiles: list[int]) -> bool:
+    return tiles == SOLVED if len(tiles) == SIZE * SIZE else tiles == list(range(1, len(tiles))) + [0]
+
+
+def shuffled(rng: random.Random | None = None, size: int = SIZE) -> list[int]:
+    """A random, solvable, not-already-solved board."""
+    rng = rng or random.Random()
+    tiles = list(range(1, size * size)) + [0]
+    while True:
+        rng.shuffle(tiles)
+        if is_solvable(tiles, size) and not is_solved(tiles):
+            return tiles[:]
+
+
+def slide(tiles: list[int], index: int, size: int = SIZE) -> int:
+    """
+    Slide the tile at ``index`` (and the ones between it and the blank) into
+    the blank, if they share a row or a column. Modifies ``tiles`` in place.
+
+    Returns:
+        How many tiles moved (0 if the move is not possible).
+    """
+    blank = tiles.index(0)
+    br, bc = divmod(blank, size)
+    r, c = divmod(index, size)
+    if index == blank or (r != br and c != bc):
+        return 0
+    step = (1 if c > bc else -1) if r == br else (size if r > br else -size)
+    moved = 0
+    pos = blank
+    while pos != index:
+        nxt = pos + step
+        tiles[pos], tiles[nxt] = tiles[nxt], tiles[pos]
+        pos = nxt
+        moved += 1
+    return moved
+
+
+def push(tiles: list[int], dx: int, dy: int, size: int = SIZE) -> int:
+    """Arrow-key move: the tile next to the blank moves in direction (dx, dy)."""
+    blank = tiles.index(0)
+    br, bc = divmod(blank, size)
+    r, c = br - dy, bc - dx  # the tile that will move into the blank
+    if 0 <= r < size and 0 <= c < size:
+        return slide(tiles, r * size + c, size)
+    return 0
+
+
+# ============================================================================
+# Game
+# ============================================================================
+
+def tile_pos(index: int) -> tuple[float, float]:
+    r, c = divmod(index, SIZE)
+    return (OFF_X + c * (TILE + GAP), OFF_Y + r * (TILE + GAP))
+
+
+def main(load_scores: Callable[[], dict] | None = None,
+         save_scores: Callable[[dict], None] | None = None) -> str:
+    """
+    Play Puzzle 15.
+
+    Returns:
+        ``"menu"`` or ``"quit"``.
+    """
+    load_scores, save_scores = gs.ensure_scores(load_scores, save_scores)
+    screen = gs.setup_screen("Puzzle 15")
+    clock = gs.GameClock(60)
+    particles = gs.Particles()
+
+    class Round:
+        def __init__(self) -> None:
+            self.tiles = shuffled()
+            self.moves = 0
+            self.timer = gs.Stopwatch()
+            self.timer.running = False
+            self.visual = {v: list(tile_pos(i)) for i, v in enumerate(self.tiles) if v}
+            self.best_moves = get_best(load_scores, "puzzle15_moves")
+            self.best_time = get_best(load_scores, "puzzle15_time")
+
+        def apply(self, moved: int) -> None:
+            if moved:
+                self.moves += moved
+                self.timer.running = True
+                sfx.play("slide")
+
+    rnd = Round()
+
+    def draw() -> None:
+        screen.fill(gs.BG)
+        frame = pygame.Rect(OFF_X - 14, OFF_Y - 14, BOARD_PX + 28, BOARD_PX + 28)
+        pygame.draw.rect(screen, (10, 8, 26), frame, border_radius=14)
+        pygame.draw.rect(screen, gs.NEON_YELLOW, frame, 3, border_radius=14)
+        for i in range(SIZE * SIZE):
+            x, y = tile_pos(i)
+            pygame.draw.rect(screen, (18, 16, 40), (x, y, TILE, TILE), border_radius=10)
+        in_place = 0
+        for i, v in enumerate(rnd.tiles):
+            if not v:
+                continue
+            x, y = rnd.visual[v]
+            rect = pygame.Rect(int(x), int(y), TILE, TILE)
+            home_row = (v - 1) // SIZE
+            color = ROW_COLORS[home_row]
+            correct = i == v - 1
+            in_place += correct
+            base = gs.lerp_color((26, 22, 56), color, 0.28 if correct else 0.12)
+            pygame.draw.rect(screen, (4, 2, 12), rect.move(4, 5), border_radius=10)
+            pygame.draw.rect(screen, base, rect, border_radius=10)
+            pygame.draw.rect(screen, color if correct else gs.lerp_color(color, gs.BG, 0.55), rect,
+                             3, border_radius=10)
+            pygame.draw.line(screen, gs.lerp_color(base, gs.WHITE, 0.25),
+                             (rect.x + 10, rect.y + 6), (rect.right - 10, rect.y + 6), 2)
+            blit_pixel_text(screen, str(v), rect.center, 6, gs.WHITE if correct else color, "center",
+                            shadow=(0, 0, 0))
+        particles.draw(screen)
+        blit_pixel_text(screen, f"MOSSE {rnd.moves}", (14, HUD_H // 2), 2, gs.NEON_CYAN, "midleft")
+        blit_pixel_text(screen, f"TEMPO {rnd.timer}", (190, HUD_H // 2), 2, gs.NEON_GREEN, "midleft")
+        blit_pixel_text(screen, f"AL POSTO {in_place}/15", (370, HUD_H // 2), 2, gs.NEON_MAGENTA, "midleft")
+        best = (f"{rnd.best_moves} · {gs.format_time(rnd.best_time or 0)}" if rnd.best_moves else "--")
+        blit_pixel_text(screen, f"RECORD {best}", (W - 14, HUD_H // 2), 2, gs.NEON_YELLOW, "midright")
+
+    arrows = {pygame.K_UP: (0, -1), pygame.K_w: (0, -1), pygame.K_DOWN: (0, 1), pygame.K_s: (0, 1),
+              pygame.K_LEFT: (-1, 0), pygame.K_a: (-1, 0), pygame.K_RIGHT: (1, 0), pygame.K_d: (1, 0)}
+
+    while True:
+        dt = clock.tick()
+        for e in pygame.event.get():
+            if gs.handle_global_event(e):
+                continue
+            if e.type == pygame.QUIT:
+                return "quit"
+            if e.type == pygame.KEYDOWN:
+                if e.key in (pygame.K_ESCAPE, pygame.K_p):
+                    choice = gs.in_game_menu(screen, "Puzzle 15", COMMANDS)
+                    clock.reset()
+                    if choice in ("menu", "quit"):
+                        return choice
+                    if choice == "restart":
+                        rnd = Round()
+                elif e.key == pygame.K_r:
+                    rnd = Round()
+                    sfx.play("select")
+                elif e.key in arrows:
+                    rnd.apply(push(rnd.tiles, *arrows[e.key]))
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                for i in range(SIZE * SIZE):
+                    x, y = tile_pos(i)
+                    if pygame.Rect(x, y, TILE, TILE).collidepoint(e.pos):
+                        moved = slide(rnd.tiles, i)
+                        if moved:
+                            rnd.apply(moved)
+                        else:
+                            sfx.play("error", 0.4)
+                        break
+
+        # ease every tile towards its slot
+        follow = min(1.0, dt * 18)
+        for i, v in enumerate(rnd.tiles):
+            if v:
+                tx, ty = tile_pos(i)
+                vis = rnd.visual[v]
+                vis[0] += (tx - vis[0]) * follow
+                vis[1] += (ty - vis[1]) * follow
+        rnd.timer.update(dt)
+        particles.update(dt)
+        draw()
+        gs.present(screen)
+
+        if is_solved(rnd.tiles) and rnd.moves > 0:
+            rnd.timer.stop()
+            for i in range(15):
+                x, y = tile_pos(i)
+                particles.burst(x + TILE // 2, y + TILE // 2, ROW_COLORS[i // SIZE], 8,
+                                speed=(60, 240), life=(0.4, 1.0))
+            for _ in range(45):
+                dt = clock.tick()
+                for i, v in enumerate(rnd.tiles):
+                    if v:
+                        rnd.visual[v] = list(tile_pos(i))
+                particles.update(dt)
+                draw()
+                gs.present(screen)
+                pygame.event.pump()
+            seconds = round(rnd.timer.elapsed, 1)
+            rec_moves = record_best(load_scores, save_scores, "puzzle15_moves", rnd.moves,
+                                    lower_is_better=True)
+            rec_time = record_best(load_scores, save_scores, "puzzle15_time", seconds,
+                                   lower_is_better=True)
+            best_moves = get_best(load_scores, "puzzle15_moves", rnd.moves)
+            best_time = get_best(load_scores, "puzzle15_time", seconds)
+            choice = gs.end_screen(screen, "COMPLETATO!", [
+                f"Mosse: {rnd.moves}   Tempo: {gs.format_time(seconds)}",
+                f"Record: {best_moves} mosse · {gs.format_time(best_time)}",
+            ], new_record=rec_moves or rec_time, win=True)
+            clock.reset()
+            if choice in ("menu", "quit"):
+                return choice
+            rnd = Round()
+
+
 class PuzzleGame:
-    """Puzzle 15 game class with animations and statistics."""
-
-    def __init__(self) -> None:
-        """Initialize the puzzle game."""
-        pygame.init()
-        self.screen = pygame.display.set_mode((W, H))
-        pygame.display.set_caption("Puzzle 15")
-        self.clock = pygame.time.Clock()
-        self.title_font = safe_font("consolas", 18)
-        self.large_font = safe_font("consolas", 30)
-        self.small_font = safe_font("consolas", 14)
-
-        self.SIZE: int = 100
-        self.GAP: int = 10
-        self.OFFSET_X: int = (W - self.SIZE * 4 - self.GAP * 3) // 2
-        self.OFFSET_Y: int = 90
-
-        # Animation tracking
-        self.animating: bool = False
-        self.anim_start_time: float = 0.0
-        self.anim_duration: float = 0.3
-        self.anim_from_pos: Tuple[int, int] = (0, 0)
-        self.anim_to_pos: Tuple[int, int] = (0, 0)
-        self.anim_tile_value: Optional[int] = None
-
-    def shuffle_board(self) -> List[List[Optional[int]]]:
-        """Generate a shuffled but solvable puzzle board.
-
-        Returns:
-            List[List[Optional[int]]]: 4x4 board with numbers 1-15 and one None.
-        """
-        vals = list(range(1, 16)) + [None]
-        while True:
-            random.shuffle(vals)
-            inv = sum(1 for i in range(16) for j in range(i + 1, 16)
-                      if vals[i] and vals[j] and vals[i] > vals[j])
-            empty_row_from_top = vals.index(None) // 4
-            empty_row_from_bottom = 4 - empty_row_from_top
-            if (inv + empty_row_from_bottom) % 2 == 0:
-                break
-        board = [vals[i * 4:(i + 1) * 4] for i in range(4)]
-        return board
-
-    def draw(self, board: List[List[Optional[int]]], move_counter: int, elapsed_time: int) -> None:
-        """Draw the puzzle board and UI.
-
-        Args:
-            board: The 4x4 puzzle board.
-            move_counter: Number of moves made.
-            elapsed_time: Elapsed time in seconds.
-        """
-        self.screen.fill(BG)
-        size = self.SIZE
-        gap = self.GAP
-        offset_x = self.OFFSET_X
-        offset_y = self.OFFSET_Y
-
-        for r in range(4):
-            for c in range(4):
-                val = board[r][c]
-                x = offset_x + c * (size + gap)
-                y = offset_y + r * (size + gap)
-                rect = pygame.Rect(x, y, size, size)
-
-                if val is None:
-                    pygame.draw.rect(self.screen, (12, 12, 18), rect)
-                else:
-                    # Check if this tile is being animated
-                    if (self.animating and self.anim_tile_value == val and
-                        (r * 4 + c) == self._get_board_index(val, board)):
-                        # Draw animation
-                        progress = min(1.0,
-                                      (pygame.time.get_ticks() - self.anim_start_time) / (self.anim_duration * 1000))
-                        anim_x = self.anim_from_pos[0] + (self.anim_to_pos[0] - self.anim_from_pos[0]) * progress
-                        anim_y = self.anim_from_pos[1] + (self.anim_to_pos[1] - self.anim_from_pos[1]) * progress
-                        tile_rect = pygame.Rect(int(anim_x), int(anim_y), size, size)
-                    else:
-                        tile_rect = rect
-
-                    pygame.draw.rect(self.screen, (80, 80, 80), tile_rect)
-                    txt = self.large_font.render(str(val), True, (240, 240, 240))
-                    self.screen.blit(txt,
-                                   (int(tile_rect.x + size // 2 - txt.get_width() // 2),
-                                    int(tile_rect.y + size // 2 - txt.get_height() // 2)))
-
-        # Draw UI
-        info = self.title_font.render(f"Moves: {move_counter}  Time: {elapsed_time}s",
-                                     True, (200, 200, 200))
-        self.screen.blit(info, (10, 10))
-
-        instructions = self.small_font.render("Click tiles or use arrow keys to move",
-                                            True, (150, 150, 150))
-        self.screen.blit(instructions, (10, 35))
-
-        pygame.display.flip()
-
-    def _get_board_index(self, val: int, board: List[List[Optional[int]]]) -> int:
-        """Get the board index (0-15) of a tile value.
-
-        Args:
-            val: Tile value to find.
-            board: The puzzle board.
-
-        Returns:
-            int: Index on the board (0-15).
-        """
-        for r in range(4):
-            for c in range(4):
-                if board[r][c] == val:
-                    return r * 4 + c
-        return -1
+    """Backwards-compatible wrapper around :func:`main`."""
 
     def run(self) -> str:
-        """Run the puzzle game loop.
-
-        Returns:
-            str: Game state command ("menu", "quit", etc.)
-        """
-        board = self.shuffle_board()
-        move_counter: int = 0
-        start_time: int = pygame.time.get_ticks()
-
-        running: bool = True
-        while running:
-            self.clock.tick(60)
-            elapsed_time: int = (pygame.time.get_ticks() - start_time) // 1000
-
-            for e in pygame.event.get():
-                if e.type == pygame.QUIT:
-                    return "menu"
-                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
-                    from game_shared import open_exit_menu
-                    res = open_exit_menu(
-                        self.screen,
-                        "Puzzle 15",
-                        COMMANDS,
-                        self.title_font,
-                        self.title_font
-                    )
-                    if res == "restart":
-                        board = self.shuffle_board()
-                        move_counter = 0
-                        start_time = pygame.time.get_ticks()
-                    else:
-                        return res
-
-                # Arrow key controls
-                if e.type == pygame.KEYDOWN:
-                    er, ec = -1, -1
-                    for i in range(4):
-                        for j in range(4):
-                            if board[i][j] is None:
-                                er, ec = i, j
-                                break
-
-                    if e.key == pygame.K_UP and er + 1 < 4:
-                        board[er][ec], board[er + 1][ec] = board[er + 1][ec], board[er][ec]
-                        move_counter += 1
-                    elif e.key == pygame.K_DOWN and er - 1 >= 0:
-                        board[er][ec], board[er - 1][ec] = board[er - 1][ec], board[er][ec]
-                        move_counter += 1
-                    elif e.key == pygame.K_LEFT and ec + 1 < 4:
-                        board[er][ec], board[er][ec + 1] = board[er][ec + 1], board[er][ec]
-                        move_counter += 1
-                    elif e.key == pygame.K_RIGHT and ec - 1 >= 0:
-                        board[er][ec], board[er][ec - 1] = board[er][ec - 1], board[er][ec]
-                        move_counter += 1
-
-                # Click controls
-                if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
-                    mx, my = e.pos
-                    size = self.SIZE
-                    gap = self.GAP
-                    offset_x = self.OFFSET_X
-                    offset_y = self.OFFSET_Y
-
-                    # Find empty position
-                    er, ec = -1, -1
-                    for i in range(4):
-                        for j in range(4):
-                            if board[i][j] is None:
-                                er, ec = i, j
-                                break
-
-                    # Check which tile was clicked
-                    for r in range(4):
-                        for c in range(4):
-                            x = offset_x + c * (size + gap)
-                            y = offset_y + r * (size + gap)
-                            rect = pygame.Rect(x, y, size, size)
-                            if rect.collidepoint(mx, my):
-                                # Only allow adjacent tiles to swap
-                                if abs(er - r) + abs(ec - c) == 1:
-                                    self.animating = True
-                                    self.anim_start_time = pygame.time.get_ticks()
-                                    self.anim_from_pos = (x, y)
-                                    self.anim_to_pos = (offset_x + ec * (size + gap),
-                                                       offset_y + er * (size + gap))
-                                    self.anim_tile_value = board[r][c]
-
-                                    board[er][ec], board[r][c] = board[r][c], board[er][ec]
-                                    move_counter += 1
-
-            # Check if animation has finished
-            if self.animating:
-                if pygame.time.get_ticks() - self.anim_start_time > self.anim_duration * 1000:
-                    self.animating = False
-
-            self.draw(board, move_counter, elapsed_time)
-
-            # Check win condition
-            flat = [cell for row in board for cell in row]
-            if flat[:-1] == list(range(1, 16)):
-                pygame.time.delay(500)
-
-                # Show congratulations screen
-                self.screen.fill(BG)
-                title = self.large_font.render("Puzzle Completato!", True, (240, 200, 80))
-                moves_txt = self.title_font.render(f"Mosse: {move_counter}", True, (180, 240, 180))
-                time_txt = self.title_font.render(f"Tempo: {elapsed_time}s", True, (180, 240, 180))
-                prompt = self.title_font.render("R: ricomincia  |  ESC: menu", True, (220, 220, 220))
-
-                self.screen.blit(title, (W // 2 - title.get_width() // 2, H // 2 - 80))
-                self.screen.blit(moves_txt, (W // 2 - moves_txt.get_width() // 2, H // 2 - 20))
-                self.screen.blit(time_txt, (W // 2 - time_txt.get_width() // 2, H // 2 + 20))
-                self.screen.blit(prompt, (W // 2 - prompt.get_width() // 2, H // 2 + 80))
-                pygame.display.flip()
-
-                waiting: bool = True
-                while waiting:
-                    for ev in pygame.event.get():
-                        if ev.type == pygame.QUIT:
-                            return "menu"
-                        if ev.type == pygame.KEYDOWN:
-                            if ev.key == pygame.K_r:
-                                board = self.shuffle_board()
-                                move_counter = 0
-                                start_time = pygame.time.get_ticks()
-                                waiting = False
-                            if ev.key == pygame.K_ESCAPE:
-                                return "menu"
-
-        return "menu"
-
-
-def main() -> str:
-    """Entry point wrapper for Puzzle 15 (used by the game launcher)."""
-    return PuzzleGame().run()
+        return main()
 
 
 if __name__ == "__main__":
     main()
+    gs.shutdown()

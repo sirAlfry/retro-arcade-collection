@@ -1,315 +1,350 @@
 # snake.py
-import pygame
+"""
+Snake - eat, grow, don't bite yourself.
+
+Rules:
+    * Red apple: +2 points, always on the field.
+    * Blue fruit: +5 points, appears for a few seconds (it blinks before
+      vanishing), then comes back after a cooldown.
+    * Speed grows with the score: 8 steps/s + 1 every 5 points (max 20).
+    * Walls and your own body are deadly.
+
+Improvements over the first version:
+    * logic on a cell grid (no pixel arithmetic), separate from the drawing;
+    * input buffer: quick "up then left" turns are no longer lost;
+    * the game waits for the first key press instead of starting instantly;
+    * particle effects now use real trigonometry (cos/sin of the angle);
+    * the field no longer overlaps the HUD; best score is saved persistently.
+"""
+from __future__ import annotations
+
+import math
 import random
-import time
-from typing import Callable, List, Tuple, Dict, Any
-from dataclasses import dataclass, field
-from enum import Enum
-from game_shared import safe_font, BG, W as SHARED_W, H as SHARED_H
+from collections import deque
+from collections.abc import Callable
 
-# we'll use local W,H same as shared
-W, H = 800, 600
+import pygame
+
+import game_shared as gs
+import sfx
+from pixel_font import blit_pixel_text
+from scores import get_best, record_best
+
+W, H = gs.W, gs.H
 GRID = 20
-
-# Max speed cap to prevent insane acceleration
+HUD_H = 40
+COLS = W // GRID
+ROWS = (H - HUD_H) // GRID
+BASE_SPEED = 8
 MAX_SPEED = 20
+BONUS_LIFETIME = 7.0
+BONUS_COOLDOWN = (4.0, 8.0)
+RED_POINTS = 2
+BLUE_POINTS = 5
 
 COMMANDS = [
-    "Muovi: Frecce o WASD",
-    "R: Ricomincia | M: Torna al menu | Q: Chiudi app | ESC: Menu in-game"
+    "Frecce o WASD: cambia direzione",
+    "Mela rossa +2   Frutto blu +5 (scade!)",
 ]
 
-
-@dataclass
-class SnakeState:
-    """Represents the complete game state for Snake."""
-    snake: List[Tuple[int, int]]
-    direction: Tuple[int, int]
-    next_direction: Tuple[int, int]
-    alive: bool
-    score: int
-    high_score: int
-    speed: float
-    red_food: Tuple[int, int]
-    blue_food: Tuple[int, int]
-    blue_visible: bool
-    blue_cooldown_until: float
-    particles: List[Dict[str, Any]] = field(default_factory=list)
-
-    def update_particles(self) -> None:
-        """Update particle life and remove expired ones."""
-        for p in self.particles[:]:
-            p['life'] -= 1
-            if p['life'] <= 0:
-                self.particles.remove(p)
+Cell = tuple[int, int]
+DIRECTIONS = {
+    pygame.K_UP: (0, -1), pygame.K_w: (0, -1),
+    pygame.K_DOWN: (0, 1), pygame.K_s: (0, 1),
+    pygame.K_LEFT: (-1, 0), pygame.K_a: (-1, 0),
+    pygame.K_RIGHT: (1, 0), pygame.K_d: (1, 0),
+}
 
 
-def snake_game(load_scores: Callable, save_scores: Callable) -> str:
+class SnakeLogic:
+    """Pure game state and rules (no drawing)."""
+
+    def __init__(self, rng: random.Random | None = None,
+                 cols: int = COLS, rows: int = ROWS) -> None:
+        self.rng = rng or random.Random()
+        self.cols, self.rows = cols, rows
+        cx, cy = cols // 2, rows // 2
+        self.body: list[Cell] = [(cx, cy), (cx - 1, cy), (cx - 2, cy)]
+        self.direction: Cell = (1, 0)
+        self.queue: deque[Cell] = deque(maxlen=3)
+        self.alive = True
+        self.started = False
+        self.score = 0
+        self.red: Cell = self.free_cell()
+        self.blue: Cell | None = None
+        self.blue_timer = 0.0                  # time left while visible
+        self.blue_cooldown = self.rng.uniform(*BONUS_COOLDOWN)
+        self.step_timer = 0.0
+        self.events: list[tuple[str, Cell]] = []
+
+    # ------------------------------------------------------------ helpers
+    def free_cell(self) -> Cell:
+        """A random cell not occupied by the snake or by other food."""
+        occupied = set(self.body)
+        if getattr(self, "red", None):
+            occupied.add(self.red)
+        if getattr(self, "blue", None):
+            occupied.add(self.blue)  # type: ignore[arg-type]
+        free = [(x, y) for x in range(self.cols) for y in range(self.rows) if (x, y) not in occupied]
+        return self.rng.choice(free) if free else self.body[-1]
+
+    @property
+    def speed(self) -> float:
+        """Steps per second."""
+        return min(BASE_SPEED + self.score // 5, MAX_SPEED)
+
+    def turn(self, d: Cell) -> None:
+        """Queue a direction change (180° turns are ignored)."""
+        last = self.queue[-1] if self.queue else self.direction
+        if d != last and d != (-last[0], -last[1]):
+            self.queue.append(d)
+        self.started = True
+
+    # -------------------------------------------------------------- rules
+    def step(self) -> None:
+        """Advance the snake by one cell."""
+        while self.queue:
+            d = self.queue.popleft()
+            if d != (-self.direction[0], -self.direction[1]):
+                self.direction = d
+                break
+        hx, hy = self.body[0]
+        head = (hx + self.direction[0], hy + self.direction[1])
+        will_grow = head == self.red or head == self.blue
+        body_to_check = self.body if will_grow else self.body[:-1]
+        if not (0 <= head[0] < self.cols and 0 <= head[1] < self.rows) or head in body_to_check:
+            self.alive = False
+            self.events.append(("die", self.body[0]))
+            return
+        self.body.insert(0, head)
+        if head == self.red:
+            self.score += RED_POINTS
+            self.events.append(("eat", head))
+            self.red = self.free_cell()
+        elif head == self.blue:
+            self.score += BLUE_POINTS
+            self.events.append(("bonus", head))
+            self.blue = None
+            self.blue_cooldown = self.rng.uniform(*BONUS_COOLDOWN)
+        else:
+            self.body.pop()
+
+    def update(self, dt: float) -> None:
+        if not self.alive or not self.started:
+            return
+        # bonus fruit timers
+        if self.blue is not None:
+            self.blue_timer -= dt
+            if self.blue_timer <= 0:
+                self.blue = None
+                self.blue_cooldown = self.rng.uniform(*BONUS_COOLDOWN)
+        else:
+            self.blue_cooldown -= dt
+            if self.blue_cooldown <= 0:
+                self.blue = self.free_cell()
+                self.blue_timer = BONUS_LIFETIME
+        # movement at a speed that depends on the score
+        self.step_timer += dt
+        interval = 1.0 / self.speed
+        while self.step_timer >= interval and self.alive:
+            self.step_timer -= interval
+            self.step()
+
+    def pop_events(self) -> list[tuple[str, Cell]]:
+        events, self.events = self.events, []
+        return events
+
+
+# ============================================================================
+# Drawing
+# ============================================================================
+
+def _field_background() -> pygame.Surface:
+    surf = pygame.Surface((COLS * GRID, ROWS * GRID))
+    for y in range(ROWS):
+        for x in range(COLS):
+            c = (16, 18, 36) if (x + y) % 2 == 0 else (20, 22, 42)
+            surf.fill(c, (x * GRID, y * GRID, GRID, GRID))
+    return surf
+
+
+def cell_rect(cell: Cell) -> pygame.Rect:
+    return pygame.Rect(cell[0] * GRID, HUD_H + cell[1] * GRID, GRID, GRID)
+
+
+def draw_snake(screen: pygame.Surface, game: SnakeLogic, flash: bool = False) -> None:
+    """Draw a continuous, gradient-colored snake with eyes on the head."""
+    n = len(game.body)
+    for i in range(n - 1, -1, -1):
+        seg = game.body[i]
+        if flash:
+            color = gs.WHITE if (i // 2) % 2 == 0 else gs.NEON_RED
+        else:
+            color = gs.lerp_color((120, 255, 140), (20, 120, 60), i / max(1, n - 1))
+        rect = cell_rect(seg)
+        if i < n - 1:  # bridge towards the previous segment -> continuous body
+            bridge = rect.inflate(-6, -6).union(cell_rect(game.body[i + 1]).inflate(-6, -6))
+            pygame.draw.rect(screen, color, bridge)
+        size = -2 if i < n - 1 else -6
+        pygame.draw.rect(screen, color, rect.inflate(size, size), border_radius=7)
+        if i % 3 == 1 and not flash:  # subtle scale pattern
+            pygame.draw.circle(screen, gs.lerp_color(color, gs.WHITE, 0.25), rect.center, 2)
+    # eyes looking where the snake goes
+    head = cell_rect(game.body[0])
+    dx, dy = game.direction
+    cx, cy = head.center
+    for side in (-1, 1):
+        ex = cx + dx * 4 + (-dy) * side * 5
+        ey = cy + dy * 4 + dx * side * 5
+        pygame.draw.circle(screen, gs.WHITE, (ex, ey), 3)
+        pygame.draw.circle(screen, gs.BLACK, (ex + dx, ey + dy), 1)
+
+
+def draw_food(screen: pygame.Surface, cell: Cell, color: gs.Color, t: float,
+              visible: bool = True) -> None:
+    if not visible:
+        return
+    rect = cell_rect(cell)
+    r = GRID // 2 - 2 + int(1.5 * math.sin(t * 6))
+    glow = pygame.Surface((GRID * 2, GRID * 2), pygame.SRCALPHA)
+    pygame.draw.circle(glow, (*color, 60), (GRID, GRID), GRID - 2)
+    screen.blit(glow, glow.get_rect(center=rect.center))
+    pygame.draw.circle(screen, color, rect.center, r)
+    pygame.draw.circle(screen, gs.lerp_color(color, gs.WHITE, 0.6),
+                       (rect.centerx - 3, rect.centery - 3), 2)
+    pygame.draw.line(screen, (90, 200, 90), (rect.centerx, rect.top + 2),
+                     (rect.centerx + 3, rect.top - 2), 2)
+
+
+# ============================================================================
+# Game loop
+# ============================================================================
+
+def main(load_scores: Callable[[], dict] | None = None,
+         save_scores: Callable[[dict], None] | None = None) -> str:
     """
-    Main Snake game loop.
-
-    Args:
-        load_scores: Callable to load high scores dictionary
-        save_scores: Callable to save high scores dictionary
+    Play Snake.
 
     Returns:
-        str: "menu" or "quit" to indicate next state
+        ``"menu"`` or ``"quit"``.
     """
-    pygame.init()
-    screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Snake")
-    clock = pygame.time.Clock()
+    load_scores, save_scores = gs.ensure_scores(load_scores, save_scores)
+    screen = gs.setup_screen("Snake")
+    clock = gs.GameClock(60)
+    field_bg = _field_background()
+    particles = gs.Particles()
+    popups = gs.FloatingTexts()
+    shake = gs.ScreenShake(8)
+    best = get_best(load_scores, "snake", 0) or 0
+    game = SnakeLogic()
+    t = 0.0
 
-    title_font = safe_font("consolas", 24)
-    small_font = safe_font("consolas", 16)
+    def draw(flash: bool = False) -> None:
+        screen.fill(gs.BG)
+        screen.blit(field_bg, (0, HUD_H))
+        pygame.draw.rect(screen, gs.NEON_GREEN, (0, HUD_H - 2, W, H - HUD_H + 2), 2)
+        draw_food(screen, game.red, gs.NEON_RED, t)
+        if game.blue is not None:
+            blinking = game.blue_timer < 2.0 and int(t * 8) % 2 == 0
+            draw_food(screen, game.blue, gs.NEON_BLUE, t, visible=not blinking)
+        draw_snake(screen, game, flash)
+        particles.draw(screen)
+        popups.draw(screen)
+        # HUD
+        blit_pixel_text(screen, f"PUNTEGGIO {game.score}", (12, HUD_H // 2), 2, gs.NEON_CYAN, "midleft")
+        blit_pixel_text(screen, f"RECORD {max(best, game.score)}", (W // 2, HUD_H // 2), 2,
+                        gs.NEON_YELLOW, "center")
+        blit_pixel_text(screen, f"LUNGHEZZA {len(game.body)}", (W - 12, HUD_H // 2), 2,
+                        gs.NEON_GREEN, "midright")
+        if game.blue is not None:
+            bar = int(120 * max(0.0, game.blue_timer) / BONUS_LIFETIME)
+            pygame.draw.rect(screen, gs.NEON_BLUE, (W // 2 - 60, HUD_H - 7, bar, 3))
+        if not game.started:
+            box = pygame.Rect(0, 0, 460, 70)
+            box.center = (W // 2, H // 2 + 60)
+            gs.draw_panel(screen, box, gs.NEON_GREEN, fill_alpha=200)
+            blit_pixel_text(screen, "PREMI UNA FRECCIA", (W // 2, box.centery - 10), 3,
+                            gs.WHITE, "center")
+            blit_pixel_text(screen, "PER INIZIARE", (W // 2, box.centery + 18), 2, gs.TEXT_DIM, "center")
+        shake.apply(screen)
 
-    def align(v: int) -> int:
-        """Align position to grid."""
-        return (v // GRID) * GRID + GRID // 2
+    while True:
+        dt = clock.tick()
+        t += dt
+        for e in pygame.event.get():
+            if gs.handle_global_event(e):
+                continue
+            if e.type == pygame.QUIT:
+                record_best(load_scores, save_scores, "snake", game.score)
+                return "quit"
+            if e.type == pygame.KEYDOWN:
+                if e.key in (pygame.K_ESCAPE, pygame.K_p):
+                    choice = gs.in_game_menu(screen, "Snake", COMMANDS)
+                    clock.reset()
+                    if choice in ("menu", "quit"):
+                        record_best(load_scores, save_scores, "snake", game.score)
+                        return choice
+                    if choice == "restart":
+                        game = SnakeLogic()
+                        particles.clear()
+                elif e.key in DIRECTIONS:
+                    game.turn(DIRECTIONS[e.key])
 
-    def spawn_food(occupied_cells: List[Tuple[int, int]]) -> Tuple[int, int]:
-        """
-        Spawn food at a random unoccupied grid cell.
+        game.update(dt)
+        for kind, cell in game.pop_events():
+            cx, cy = cell_rect(cell).center
+            if kind == "eat":
+                sfx.play("eat")
+                particles.burst(cx, cy, (gs.NEON_RED, gs.NEON_ORANGE, gs.NEON_YELLOW), 14,
+                                speed=(60, 200), life=(0.25, 0.6))
+                popups.add(f"+{RED_POINTS}", cx, cy - 10, gs.NEON_YELLOW)
+            elif kind == "bonus":
+                sfx.play("bonus")
+                particles.burst(cx, cy, (gs.NEON_BLUE, gs.NEON_CYAN, gs.WHITE), 24,
+                                speed=(80, 260), life=(0.3, 0.8))
+                popups.add(f"+{BLUE_POINTS}", cx, cy - 10, gs.NEON_CYAN, 1.0, 3)
+            elif kind == "die":
+                sfx.play("hurt")
+                shake.add(0.7)
+                for seg in game.body[::2]:
+                    sx, sy = cell_rect(seg).center
+                    particles.burst(sx, sy, (gs.NEON_GREEN, gs.WHITE), 5,
+                                    speed=(40, 180), life=(0.4, 0.9))
+        particles.update(dt)
+        popups.update(dt)
+        shake.update(dt)
+        draw()
+        gs.present(screen)
 
-        Args:
-            occupied_cells: List of occupied (grid_x, grid_y) positions
-
-        Returns:
-            Tuple of (pixel_x, pixel_y) for food position
-        """
-        occ = set(occupied_cells)
-        attempts = 0
-        while True:
-            gx = random.randrange(0, W // GRID)
-            gy = random.randrange(0, H // GRID)
-            cell = (gx, gy)
-            if cell not in occ:
-                return (gx * GRID + GRID // 2, gy * GRID + GRID // 2)
-            attempts += 1
-            if attempts > 1000:
-                # fallback: search linearly
-                for gy2 in range(0, H // GRID):
-                    for gx2 in range(0, W // GRID):
-                        if (gx2, gy2) not in occ:
-                            return (gx2 * GRID + GRID // 2, gy2 * GRID + GRID // 2)
-
-    def reset() -> SnakeState:
-        """Reset game to initial state."""
-        headx = align(W // 2)
-        heady = align(H // 2)
-        snake = [(headx, heady), (headx - GRID, heady), (headx - 2 * GRID, heady)]
-        red = spawn_food([(x // GRID, y // GRID) for (x, y) in snake])
-        blue = spawn_food([(x // GRID, y // GRID) for (x, y) in snake] + [(red[0] // GRID, red[1] // GRID)])
-
-        # Load high score
-        try:
-            scores = load_scores()
-            high_score = scores.get("snake", 0)
-        except Exception:
-            high_score = 0
-
-        return SnakeState(
-            snake=snake,
-            direction=(GRID, 0),
-            next_direction=(GRID, 0),
-            alive=True,
-            score=0,
-            high_score=high_score,
-            speed=8,
-            red_food=red,
-            blue_food=blue,
-            blue_visible=True,
-            blue_cooldown_until=0,
-            particles=[]
-        )
-
-    def save_if_high(score: int) -> None:
-        """Save score if it's a new high score."""
-        try:
-            scores = load_scores()
-            if score > scores.get("snake", 0):
-                scores["snake"] = score
-                save_scores(scores)
-        except Exception:
-            pass
-
-    def add_particle(x: int, y: int) -> None:
-        """Add a particle effect at given coordinates."""
-        for _ in range(8):
-            angle = random.uniform(0, 6.28)
-            speed = random.uniform(1, 3)
-            state.particles.append({
-                'x': x,
-                'y': y,
-                'vx': speed * (angle ** 0.5),
-                'vy': speed * (1 - angle ** 0.5),
-                'life': 20,
-                'color': (random.randint(100, 255), random.randint(100, 255), 50)
-            })
-
-    def draw_grid_background() -> None:
-        """Draw subtle grid pattern background."""
-        for x in range(0, W, GRID):
-            pygame.draw.line(screen, (40, 40, 50), (x, 0), (x, H), 1)
-        for y in range(0, H, GRID):
-            pygame.draw.line(screen, (40, 40, 50), (0, y), (W, y), 1)
-
-    def get_snake_color(segment_index: int, total_segments: int) -> Tuple[int, int, int]:
-        """
-        Get gradient color for snake body segment.
-        Head is bright, tail is darker.
-        """
-        if segment_index == 0:  # head
-            return (100, 255, 100)
-        else:
-            # Gradient from middle to tail
-            ratio = segment_index / max(1, total_segments - 1)
-            brightness = int(160 * (1 - ratio * 0.6))
-            return (20, brightness, 30)
-
-    state = reset()
-    running = True
-
-    while running:
-        # Cap speed to prevent insane acceleration
-        capped_speed = min(state.speed + state.score // 5, MAX_SPEED)
-        dt = clock.tick(capped_speed)
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-                return "menu"
-            if event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE,):
-                    from game_shared import in_game_menu
-                    choice = in_game_menu(screen, "Snake", COMMANDS, title_font, small_font)
-                    if choice == "menu":
-                        save_if_high(state.score)
-                        return "menu"
-                    elif choice == "quit":
-                        save_if_high(state.score)
-                        pygame.quit()
-                        return "quit"
-                    elif choice == "restart":
-                        state = reset()
-                        continue
-                if event.key == pygame.K_r:
-                    state = reset()
-                if event.key == pygame.K_m:
-                    save_if_high(state.score)
-                    return "menu"
-                if event.key == pygame.K_q:
-                    save_if_high(state.score)
-                    pygame.quit()
-                    return "quit"
-                if event.key in (pygame.K_LEFT, pygame.K_a):
-                    if state.direction != (GRID, 0):
-                        state.next_direction = (-GRID, 0)
-                if event.key in (pygame.K_RIGHT, pygame.K_d):
-                    if state.direction != (-GRID, 0):
-                        state.next_direction = (GRID, 0)
-                if event.key in (pygame.K_UP, pygame.K_w):
-                    if state.direction != (0, GRID):
-                        state.next_direction = (0, -GRID)
-                if event.key in (pygame.K_DOWN, pygame.K_s):
-                    if state.direction != (0, -GRID):
-                        state.next_direction = (0, GRID)
-
-        if not state.alive:
-            screen.fill(BG)
-            draw_grid_background()
-            txt = title_font.render("GAME OVER", True, (240, 200, 80))
-            scr = small_font.render(f"Score: {state.score}  |  High Score: {state.high_score}", True, (220, 220, 220))
-            stats = small_font.render(f"Length: {len(state.snake)}  |  R: restart  |  M: menu", True, (180, 200, 180))
-            screen.blit(txt, (W // 2 - txt.get_width() // 2, H // 2 - 50))
-            screen.blit(scr, (W // 2 - scr.get_width() // 2, H // 2 - 10))
-            screen.blit(stats, (W // 2 - stats.get_width() // 2, H // 2 + 20))
-            pygame.display.flip()
-            pygame.event.pump()
-            continue
-
-        state.direction = state.next_direction
-        head_x, head_y = state.snake[0]
-        dx, dy = state.direction
-        new_head = (head_x + dx, head_y + dy)
-
-        hx, hy = new_head
-        if hx - GRID // 2 < 0 or hy - GRID // 2 < 0 or hx + GRID // 2 > W or hy + GRID // 2 > H:
-            state.alive = False
-            save_if_high(state.score)
-            continue
-
-        if new_head in state.snake:
-            state.alive = False
-            save_if_high(state.score)
-            continue
-
-        state.snake.insert(0, new_head)
-
-        # eat red food (grid aligned)
-        if (abs(new_head[0] - state.red_food[0]) < GRID and
-                abs(new_head[1] - state.red_food[1]) < GRID):
-            state.score += 2
-            add_particle(state.red_food[0], state.red_food[1])
-            occ = [(x // GRID, y // GRID) for (x, y) in state.snake]
-            state.red_food = spawn_food(occ + [(state.blue_food[0] // GRID, state.blue_food[1] // GRID)])
-        elif state.blue_visible and (abs(new_head[0] - state.blue_food[0]) < GRID and
-                                      abs(new_head[1] - state.blue_food[1]) < GRID):
-            state.score += 5
-            add_particle(state.blue_food[0], state.blue_food[1])
-            state.blue_visible = False
-            state.blue_cooldown_until = pygame.time.get_ticks() + 5000
-            # grow: don't pop tail
-        else:
-            state.snake.pop()
-
-        if (not state.blue_visible) and pygame.time.get_ticks() >= state.blue_cooldown_until:
-            occ = [(x // GRID, y // GRID) for (x, y) in state.snake]
-            state.blue_food = spawn_food(occ + [(state.red_food[0] // GRID, state.red_food[1] // GRID)])
-            state.blue_visible = True
-
-        # Update particles
-        state.update_particles()
-
-        # draw
-        screen.fill(BG)
-        draw_grid_background()
-
-        # Draw food
-        pygame.draw.circle(screen, (200, 30, 30), state.red_food, GRID // 2 - 2)
-        if state.blue_visible:
-            pygame.draw.circle(screen, (50, 140, 220), state.blue_food, GRID // 2 - 2)
-
-        # Draw snake with gradient
-        for i, seg in enumerate(state.snake):
-            col = get_snake_color(i, len(state.snake))
-            pygame.draw.rect(screen, col, pygame.Rect(seg[0] - GRID // 2, seg[1] - GRID // 2, GRID, GRID))
-
-        # Draw particles
-        for p in state.particles:
-            p['x'] += p['vx']
-            p['y'] += p['vy']
-            alpha = max(0, int(255 * (p['life'] / 20)))
-            surf = pygame.Surface((4, 4))
-            surf.fill(p['color'])
-            surf.set_alpha(alpha)
-            screen.blit(surf, (int(p['x']), int(p['y'])))
-
-        # Draw HUD
-        score_s = small_font.render(f"SCORE: {state.score}", True, (180, 240, 180))
-        high_s = small_font.render(f"HIGH: {state.high_score}", True, (200, 200, 150))
-        screen.blit(score_s, (10, 10))
-        screen.blit(high_s, (10, 30))
-        pygame.display.flip()
-
-    pygame.quit()
-    return "menu"
+        if not game.alive:
+            # short death animation before the results screen
+            for i in range(45):
+                dt = clock.tick()
+                t += dt
+                particles.update(dt)
+                shake.update(dt)
+                draw(flash=(i // 6) % 2 == 0)
+                gs.present(screen)
+                pygame.event.pump()
+            new_record = record_best(load_scores, save_scores, "snake", game.score)
+            best = max(best, game.score)
+            choice = gs.end_screen(screen, "GAME OVER", [
+                f"Punteggio: {game.score}   Lunghezza: {len(game.body)}",
+                f"Record: {best}",
+            ], new_record=new_record)
+            clock.reset()
+            if choice in ("menu", "quit"):
+                return choice
+            game = SnakeLogic()
+            particles.clear()
+            popups.clear()
 
 
-# small helper if executed directly
+def snake_game(load_scores: Callable[[], dict], save_scores: Callable[[dict], None]) -> str:
+    """Backwards-compatible entry point (old launcher signature)."""
+    return main(load_scores, save_scores)
+
+
 if __name__ == "__main__":
-    def _load_scores():
-        return {}
-    def _save_scores(s):
-        pass
-    snake_game(_load_scores, _save_scores)
+    main()
+    gs.shutdown()

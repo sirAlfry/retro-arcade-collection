@@ -1,268 +1,347 @@
 # pong.py
-import pygame
+"""
+Pong - the 1972 classic.
+
+Modes (chosen when the game starts):
+    * 1 player vs CPU - easy / medium / hard
+    * 2 players on the same keyboard
+
+What changed compared to the first version:
+    * the old "1P" and "VS AI" modes were the same thing: now there is one
+      clear vs-CPU mode with three real difficulty levels;
+    * the CPU *predicts* where the ball will arrive (bounces included), with a
+      reaction delay and an aiming error that depend on the difficulty;
+    * frame-rate independent physics (pixels per second), proper rectangle
+      collisions, the ball can no longer get stuck in walls or paddles;
+    * the ball speeds up a little on every hit and the bounce angle depends
+      on where it touches the paddle;
+    * a serve countdown after each point, and a working victory screen
+      (the old one froze the game forever).
+"""
+from __future__ import annotations
+
+import math
 import random
-from typing import Tuple, List, Optional
-from dataclasses import dataclass, field
-from game_shared import safe_font, BG
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
 
-W, H = 800, 600
+import pygame
 
-# Max ball velocity to prevent insane speeds
-MAX_BALL_SPEED = 12
+import game_shared as gs
+import sfx
+from pixel_font import blit_pixel_text
+from scores import get_best
+
+W, H = gs.W, gs.H
+TOP, BOTTOM = 14, H - 14          # playfield walls
+PADDLE_W, PADDLE_H = 12, 90
+PADDLE_X_MARGIN = 34
+PADDLE_SPEED = 470.0              # px/s for human players
+BALL_R = 8
+BALL_START_SPEED = 380.0
+BALL_MAX_SPEED = 950.0
+SPEEDUP = 1.06
+MAX_BOUNCE_ANGLE = math.radians(60)
+WIN_SCORE = 11
+SERVE_DELAY = 1.0
 
 COMMANDS = [
-    "W/S: Player 1  |  UP/DOWN: Player 2",
-    "TAB: toggle 1P/2P/VS AI  |  SPACE: pausa  |  ESC: menu"
+    "Giocatore 1: W / S   (in 1P anche le frecce)",
+    "Giocatore 2: frecce ↑ / ↓   Vince chi arriva a 11",
 ]
 
-
-@dataclass
-class BallTrail:
-    """Represents a ghost position in the ball trail."""
-    x: float
-    y: float
-    life: int  # 0-10, fades out
+MODES = ("1 GIOCATORE · FACILE", "1 GIOCATORE · MEDIO", "1 GIOCATORE · DIFFICILE", "2 GIOCATORI")
 
 
-def ai_move(paddle_y: float, ball_y: float, difficulty: int) -> float:
+@dataclass(frozen=True)
+class AIProfile:
+    speed: float      # max paddle speed (px/s)
+    error: float      # max aiming error (px)
+    reaction: float   # seconds between two "looks" at the ball
+
+
+AI_LEVELS = (
+    AIProfile(speed=260.0, error=70.0, reaction=0.28),
+    AIProfile(speed=390.0, error=34.0, reaction=0.12),
+    AIProfile(speed=560.0, error=10.0, reaction=0.04),
+)
+
+
+def predict_y(x: float, y: float, vx: float, vy: float, target_x: float,
+              top: float = TOP + BALL_R, bottom: float = BOTTOM - BALL_R) -> float:
     """
-    Calculate AI paddle movement.
+    Where will the ball cross ``target_x``? Wall bounces are "unfolded":
+    the trajectory is a straight line in a mirrored space, folded back
+    into ``[top, bottom]`` with a modulo. Returns the centre if unreachable.
+    """
+    if vx == 0 or (target_x - x) / vx < 0:
+        return (top + bottom) / 2
+    t = (target_x - x) / vx
+    span = bottom - top
+    py = (y + vy * t - top) % (2 * span)
+    if py > span:
+        py = 2 * span - py
+    return top + py
 
-    Args:
-        paddle_y: Current Y position of paddle
-        ball_y: Current Y position of ball
-        difficulty: 1 (easy), 2 (medium), 3 (hard)
+
+class Paddle:
+    def __init__(self, x: float) -> None:
+        self.rect = pygame.Rect(0, 0, PADDLE_W, PADDLE_H)
+        self.rect.center = (int(x), H // 2)
+        self.y = float(self.rect.centery)
+        self.flash = 0.0
+
+    def move(self, dy: float) -> None:
+        self.y = max(TOP + PADDLE_H / 2, min(BOTTOM - PADDLE_H / 2, self.y + dy))
+        self.rect.centery = int(self.y)
+
+
+class CPU:
+    """Computer-controlled paddle with human-like imperfections."""
+
+    def __init__(self, profile: AIProfile) -> None:
+        self.profile = profile
+        self.target = H / 2
+        self.look_timer = 0.0
+        self.error = 0.0
+
+    def new_rally(self) -> None:
+        self.error = random.uniform(-self.profile.error, self.profile.error)
+
+    def update(self, dt: float, paddle: Paddle, ball: Ball) -> None:
+        self.look_timer -= dt
+        if self.look_timer <= 0:
+            self.look_timer = self.profile.reaction
+            if ball.vx > 0:
+                self.target = predict_y(ball.x, ball.y, ball.vx, ball.vy, paddle.rect.left) + self.error
+            else:
+                self.target = H / 2  # drift back to the centre
+        diff = self.target - paddle.y
+        step = self.profile.speed * dt
+        if abs(diff) > 4:
+            paddle.move(max(-step, min(step, diff)))
+
+
+class Ball:
+    def __init__(self) -> None:
+        self.x = W / 2
+        self.y = H / 2
+        self.vx = 0.0
+        self.vy = 0.0
+        self.speed = BALL_START_SPEED
+        self.trail: deque[tuple[float, float]] = deque(maxlen=12)
+
+    def serve(self, direction: int) -> None:
+        self.x, self.y = W / 2, random.uniform(H * 0.3, H * 0.7)
+        self.speed = BALL_START_SPEED
+        angle = random.uniform(-0.45, 0.45)
+        self.vx = direction * self.speed * math.cos(angle)
+        self.vy = self.speed * math.sin(angle)
+        self.trail.clear()
+
+    @property
+    def rect(self) -> pygame.Rect:
+        return pygame.Rect(int(self.x - BALL_R), int(self.y - BALL_R), BALL_R * 2, BALL_R * 2)
+
+
+def _ball_sprites() -> list[pygame.Surface]:
+    sprites = []
+    for i in range(12):
+        s = pygame.Surface((BALL_R * 2, BALL_R * 2), pygame.SRCALPHA)
+        alpha = int(150 * (i + 1) / 12)
+        pygame.draw.circle(s, (120, 220, 255, alpha), (BALL_R, BALL_R), max(2, BALL_R * (i + 4) // 16))
+        sprites.append(s)
+    return sprites
+
+
+def main(load_scores: Callable[[], dict] | None = None,
+         save_scores: Callable[[dict], None] | None = None) -> str:
+    """
+    Play Pong.
 
     Returns:
-        Movement delta
+        ``"menu"`` or ``"quit"``.
     """
-    if difficulty == 1:
-        if random.random() < 0.6:
-            if paddle_y + 30 < ball_y:
-                return 4
-            if paddle_y - 30 > ball_y:
-                return -4
-        return 0
-    if difficulty == 2:
-        if paddle_y + 10 < ball_y:
-            return 5
-        if paddle_y - 10 > ball_y:
-            return -5
-        return 0
-    if paddle_y + 5 < ball_y:
-        return 6
-    if paddle_y - 5 > ball_y:
-        return -6
-    return 0
+    load_scores, save_scores = gs.ensure_scores(load_scores, save_scores)
+    screen = gs.setup_screen("Pong")
+    clock = gs.GameClock(60)
 
+    backdrop = pygame.Surface((W, H))
+    backdrop.fill(gs.BG)
+    choice = gs.select_menu(screen, "PONG", MODES, ["Scegli la modalità di gioco"], default=1,
+                            backdrop=backdrop)
+    if isinstance(choice, str):
+        return choice
+    mode = choice
+    vs_cpu = mode < 3
+    cpu = CPU(AI_LEVELS[mode]) if vs_cpu else None
 
-def main() -> str:
-    """
-    Main Pong game loop.
+    trail_sprites = _ball_sprites()
+    particles = gs.Particles()
+    shake = gs.ScreenShake(7)
+    score_font_scale = 6
 
-    Returns:
-        str: "menu" or "quit" to indicate next state
-    """
-    pygame.init()
-    screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Pong")
-    clock = pygame.time.Clock()
+    def reset() -> tuple[Paddle, Paddle, Ball, list[int]]:
+        b = Ball()
+        b.serve(random.choice((-1, 1)))
+        b.vx = b.vy = 0.0
+        return Paddle(PADDLE_X_MARGIN), Paddle(W - PADDLE_X_MARGIN), b, [0, 0]
 
-    # Cache fonts at initialization
-    font_large = safe_font("consolas", 28)
-    font_small = safe_font("consolas", 14)
+    left, right, ball, score = reset()
+    serve_timer = SERVE_DELAY
+    serve_dir = random.choice((-1, 1))
+    if cpu:
+        cpu.new_rally()
 
-    mode = "2P"
-    ai_diff = 2
+    def draw() -> None:
+        screen.fill(gs.BG)
+        pygame.draw.line(screen, (70, 70, 120), (0, TOP - 2), (W, TOP - 2), 4)
+        pygame.draw.line(screen, (70, 70, 120), (0, BOTTOM + 2), (W, BOTTOM + 2), 4)
+        for y in range(TOP + 6, BOTTOM, 26):
+            pygame.draw.rect(screen, (60, 60, 105), (W // 2 - 3, y, 6, 14))
+        blit_pixel_text(screen, str(score[0]), (W // 2 - 60, 30), score_font_scale, gs.NEON_CYAN, "midtop")
+        blit_pixel_text(screen, str(score[1]), (W // 2 + 60, 30), score_font_scale, gs.NEON_MAGENTA, "midtop")
+        left_label = "TU" if vs_cpu else "G1"
+        right_label = ("CPU " + ("FACILE", "MEDIO", "DIFFICILE")[mode]) if vs_cpu else "G2"
+        blit_pixel_text(screen, left_label, (W // 2 - 110, 40), 2, gs.TEXT_DIM, "topright")
+        blit_pixel_text(screen, right_label, (W // 2 + 110, 40), 2, gs.TEXT_DIM, "topleft")
+        for paddle, color in ((left, gs.NEON_CYAN), (right, gs.NEON_MAGENTA)):
+            glow = pygame.Surface((PADDLE_W + 16, PADDLE_H + 16), pygame.SRCALPHA)
+            pygame.draw.rect(glow, (*color, 50), glow.get_rect(), border_radius=8)
+            screen.blit(glow, paddle.rect.inflate(16, 16))
+            c = gs.WHITE if paddle.flash > 0 else color
+            pygame.draw.rect(screen, c, paddle.rect, border_radius=4)
+        for i, (tx, ty) in enumerate(ball.trail):
+            spr = trail_sprites[min(i, len(trail_sprites) - 1)]
+            screen.blit(spr, spr.get_rect(center=(int(tx), int(ty))))
+        if serve_timer <= 0 or int(serve_timer * 8) % 2 == 0:
+            pygame.draw.circle(screen, gs.WHITE, (int(ball.x), int(ball.y)), BALL_R)
+        if serve_timer > 0:
+            blit_pixel_text(screen, "PRONTI!", (W // 2, H // 2 + 60), 3, gs.NEON_YELLOW, "center")
+        particles.draw(screen)
+        shake.apply(screen)
 
-    paddle_w, paddle_h = 10, 80
-    left_y = H // 2
-    right_y = H // 2
-    ball_x = W // 2
-    ball_y = H // 2
-    ball_vx = 6 * random.choice((-1, 1))
-    ball_vy = 4 * random.choice((-1, 1))
-    score_l, score_r = 0, 0
-
-    running = True
-    paused = False
-    BALL_R = 8
-
-    # Ball trail effect
-    ball_trail: List[BallTrail] = []
-    TRAIL_MAX_AGE = 10
-
-    def reset_ball() -> Tuple[float, float, float, float]:
-        """Reset ball to center with random velocity."""
-        return W // 2, H // 2, 6 * random.choice((-1, 1)), 4 * random.choice((-1, 1))
-
-    def update_ball_trail() -> None:
-        """Update ball trail and remove old positions."""
-        nonlocal ball_trail
-        # Add current position to trail
-        ball_trail.append(BallTrail(ball_x, ball_y, TRAIL_MAX_AGE))
-        # Age all trail points
-        for trail in ball_trail:
-            trail.life -= 1
-        # Remove dead trail points
-        ball_trail = [t for t in ball_trail if t.life > 0]
-
-    def clamp_ball_velocity() -> None:
-        """Clamp ball velocity to prevent it going crazy."""
-        nonlocal ball_vx, ball_vy
-        speed = (ball_vx ** 2 + ball_vy ** 2) ** 0.5
-        if speed > MAX_BALL_SPEED:
-            ball_vx *= MAX_BALL_SPEED / speed
-            ball_vy *= MAX_BALL_SPEED / speed
-
-    while running:
-        dt = clock.tick(60)
+    while True:
+        dt = clock.tick()
         for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                running = False
-                return "menu"
-            if e.type == pygame.KEYDOWN:
-                if e.key == pygame.K_ESCAPE:
-                    from game_shared import in_game_menu
-                    choice = in_game_menu(screen, "Pong", COMMANDS, font_small, font_small)
-                    if choice == "menu":
-                        return "menu"
-                    if choice == "quit":
-                        pygame.quit()
-                        return "quit"
-                    if choice == "restart":
-                        left_y = right_y = H // 2
-                        ball_x, ball_y, ball_vx, ball_vy = reset_ball()
-                        score_l = score_r = 0
-                        ball_trail = []
-                if e.key == pygame.K_TAB:
-                    if mode == "2P":
-                        mode = "1P"
-                    elif mode == "1P":
-                        mode = "VS AI"
-                    else:
-                        mode = "2P"
-                if e.key == pygame.K_SPACE:
-                    paused = not paused
-
-        if not paused:
-            keys = pygame.key.get_pressed()
-
-            # Left paddle (P1) - always available
-            if keys[pygame.K_w]:
-                left_y -= 6
-            if keys[pygame.K_s]:
-                left_y += 6
-
-            # Right paddle (P2 or AI)
-            if mode == "2P":
-                # Two player mode: both can control right paddle
-                if keys[pygame.K_UP]:
-                    right_y -= 6
-                if keys[pygame.K_DOWN]:
-                    right_y += 6
-            elif mode == "1P":
-                # One player mode: right paddle is AI (not controlled by player)
-                mv = ai_move(right_y, ball_y, 1)
-                right_y += mv
-            else:  # VS AI
-                # AI mode: right paddle is AI with difficulty
-                mv = ai_move(right_y, ball_y, ai_diff)
-                right_y += mv
-
-            # Clamp paddles
-            left_y = max(paddle_h // 2, min(H - paddle_h // 2, left_y))
-            right_y = max(paddle_h // 2, min(H - paddle_h // 2, right_y))
-
-            # Move ball
-            ball_x += ball_vx
-            ball_y += ball_vy
-            update_ball_trail()
-
-            # Ball boundary collision (top/bottom)
-            if ball_y - BALL_R <= 0 or ball_y + BALL_R >= H:
-                ball_vy *= -1
-
-            # Left paddle collision
-            if ball_x - BALL_R <= 40:
-                if left_y - paddle_h // 2 <= ball_y <= left_y + paddle_h // 2:
-                    ball_vx = abs(ball_vx)
-                    offset = (ball_y - left_y) / (paddle_h / 2)
-                    ball_vy += offset * 3
-                    clamp_ball_velocity()
-
-            # Right paddle collision
-            if ball_x + BALL_R >= W - 40:
-                if right_y - paddle_h // 2 <= ball_y <= right_y + paddle_h // 2:
-                    ball_vx = -abs(ball_vx)
-                    offset = (ball_y - right_y) / (paddle_h / 2)
-                    ball_vy += offset * 3
-                    clamp_ball_velocity()
-
-            # Goal detection
-            if ball_x < 0:
-                score_r += 1
-                ball_x, ball_y, ball_vx, ball_vy = reset_ball()
-                ball_trail = []
-            if ball_x > W:
-                score_l += 1
-                ball_x, ball_y, ball_vx, ball_vy = reset_ball()
-                ball_trail = []
-
-            # Check for win condition (first to 11)
-            if score_l >= 11 or score_r >= 11:
-                # Win screen
-                winner = "LEFT" if score_l >= 11 else "RIGHT"
-                screen.fill(BG)
-
-                win_txt = font_large.render(f"PLAYER {winner} WINS!", True, (255, 200, 100))
-                final_score = font_small.render(f"Final Score: {score_l} - {score_r}", True, (200, 200, 200))
-                menu_txt = font_small.render("Press ESC for menu or TAB to play again", True, (150, 200, 150))
-
-                screen.blit(win_txt, (W // 2 - win_txt.get_width() // 2, H // 2 - 60))
-                screen.blit(final_score, (W // 2 - final_score.get_width() // 2, H // 2 - 10))
-                screen.blit(menu_txt, (W // 2 - menu_txt.get_width() // 2, H // 2 + 40))
-                pygame.display.flip()
-                pygame.event.pump()
+            if gs.handle_global_event(e):
                 continue
+            if e.type == pygame.QUIT:
+                return "quit"
+            if e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_p, pygame.K_SPACE):
+                choice = gs.in_game_menu(screen, "Pong", COMMANDS)
+                clock.reset()
+                if choice in ("menu", "quit"):
+                    return choice
+                if choice == "restart":
+                    left, right, ball, score = reset()
+                    serve_timer = SERVE_DELAY
 
-        # draw
-        screen.fill(BG)
+        # --- input
+        keys = pygame.key.get_pressed()
+        step = PADDLE_SPEED * dt
+        up1 = keys[pygame.K_w] or (vs_cpu and keys[pygame.K_UP])
+        down1 = keys[pygame.K_s] or (vs_cpu and keys[pygame.K_DOWN])
+        if up1:
+            left.move(-step)
+        if down1:
+            left.move(step)
+        if cpu:
+            cpu.update(dt, right, ball)
+        else:
+            if keys[pygame.K_UP]:
+                right.move(-step)
+            if keys[pygame.K_DOWN]:
+                right.move(step)
 
-        # Draw center line
-        for y in range(0, H, 24):
-            pygame.draw.rect(screen, (80, 80, 100), (W // 2 - 4, y + 8, 8, 12))
+        # --- serve
+        if serve_timer > 0:
+            serve_timer -= dt
+            if serve_timer <= 0:
+                ball.serve(serve_dir)
+                if cpu:
+                    cpu.new_rally()
+                sfx.play("blip")
 
-        # Draw paddles
-        pygame.draw.rect(screen, (240, 240, 240), (30, left_y - paddle_h // 2, paddle_w, paddle_h))
-        pygame.draw.rect(screen, (240, 240, 240), (W - 30 - paddle_w, right_y - paddle_h // 2, paddle_w, paddle_h))
+        # --- ball physics
+        if serve_timer <= 0:
+            ball.trail.append((ball.x, ball.y))
+            ball.x += ball.vx * dt
+            ball.y += ball.vy * dt
+            if ball.y - BALL_R < TOP:
+                ball.y = TOP + BALL_R
+                ball.vy = abs(ball.vy)
+                sfx.play("wall")
+            elif ball.y + BALL_R > BOTTOM:
+                ball.y = BOTTOM - BALL_R
+                ball.vy = -abs(ball.vy)
+                sfx.play("wall")
 
-        # Draw ball trail
-        for trail in ball_trail:
-            alpha = int(80 * (trail.life / TRAIL_MAX_AGE))
-            trail_surf = pygame.Surface((BALL_R * 2, BALL_R * 2))
-            trail_surf.set_colorkey((0, 0, 0))
-            pygame.draw.circle(trail_surf, (120, 120, 120), (BALL_R, BALL_R), BALL_R)
-            trail_surf.set_alpha(alpha)
-            screen.blit(trail_surf, (int(trail.x) - BALL_R, int(trail.y) - BALL_R))
+            for paddle, direction in ((left, 1), (right, -1)):
+                moving_towards = (ball.vx < 0) if direction == 1 else (ball.vx > 0)
+                if moving_towards and ball.rect.colliderect(paddle.rect):
+                    offset = max(-1.0, min(1.0, (ball.y - paddle.y) / (PADDLE_H / 2)))
+                    angle = offset * MAX_BOUNCE_ANGLE
+                    ball.speed = min(BALL_MAX_SPEED, ball.speed * SPEEDUP)
+                    ball.vx = direction * ball.speed * math.cos(angle)
+                    ball.vy = ball.speed * math.sin(angle)
+                    ball.x = (paddle.rect.right + BALL_R) if direction == 1 else (paddle.rect.left - BALL_R)
+                    paddle.flash = 0.08
+                    color = gs.NEON_CYAN if direction == 1 else gs.NEON_MAGENTA
+                    particles.burst(ball.x, ball.y, (color, gs.WHITE), 10,
+                                    speed=(80, 260), life=(0.15, 0.4),
+                                    angle=0 if direction == 1 else math.pi, spread=2.2)
+                    sfx.play("hit")
+                    if cpu and direction == 1:
+                        cpu.new_rally()
 
-        # Draw ball
-        pygame.draw.circle(screen, (240, 240, 240), (int(ball_x), int(ball_y)), BALL_R)
+            scorer = None
+            if ball.x < -BALL_R * 2:
+                scorer = 1
+            elif ball.x > W + BALL_R * 2:
+                scorer = 0
+            if scorer is not None:
+                score[scorer] += 1
+                sfx.play("score")
+                shake.add(0.45)
+                particles.burst(W // 2 + (60 if scorer else -60), 60,
+                                gs.NEON_MAGENTA if scorer else gs.NEON_CYAN, 30,
+                                speed=(60, 220), life=(0.4, 0.9))
+                serve_dir = -1 if scorer == 1 else 1   # serve towards who conceded
+                ball.vx = ball.vy = 0.0
+                ball.x, ball.y = W / 2, H / 2
+                ball.trail.clear()
+                serve_timer = SERVE_DELAY
 
-        # Draw scores using cached font
-        s1 = font_large.render(str(score_l), True, (180, 240, 180))
-        s2 = font_large.render(str(score_r), True, (180, 240, 180))
-        screen.blit(s1, (W // 2 - 80, 20))
-        screen.blit(s2, (W // 2 + 60, 20))
+        for paddle in (left, right):
+            paddle.flash = max(0.0, paddle.flash - dt)
+        particles.update(dt)
+        shake.update(dt)
+        draw()
+        gs.present(screen)
 
-        # Draw mode label using cached font
-        label = font_small.render(f"Mode: {mode}", True, (220, 220, 220))
-        screen.blit(label, (10, 10))
-        pygame.display.flip()
-
-    pygame.quit()
-    return "menu"
+        # --- victory
+        if max(score) >= WIN_SCORE:
+            left_won = score[0] > score[1]
+            if vs_cpu:
+                title = "HAI VINTO!" if left_won else "HAI PERSO!"
+                if left_won:
+                    wins = (get_best(load_scores, "pong_wins", 0) or 0) + 1
+                    save_scores({"pong_wins": wins})
+                lines = [f"Punteggio finale: {score[0]} - {score[1]}",
+                         f"Vittorie contro la CPU: {get_best(load_scores, 'pong_wins', 0) or 0}"]
+            else:
+                title = "VINCE G1!" if left_won else "VINCE G2!"
+                lines = [f"Punteggio finale: {score[0]} - {score[1]}"]
+            choice = gs.end_screen(screen, title, lines, win=left_won or not vs_cpu)
+            clock.reset()
+            if choice in ("menu", "quit"):
+                return choice
+            left, right, ball, score = reset()
+            serve_timer = SERVE_DELAY
 
 
 if __name__ == "__main__":
     main()
+    gs.shutdown()

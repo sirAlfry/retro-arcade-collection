@@ -1,0 +1,49 @@
+[project]
+name = "retro-arcade-collection"
+version = "3.0.0"
+description = "Nine classic arcade minigames in Python + Pygame-CE, with a synthwave launcher."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Alfredo De Donno (Sir Alfry)" }]
+requires-python = ">=3.10"
+dependencies = ["pygame-ce>=2.4.0"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Games/Entertainment :: Arcade",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5", "pyinstaller>=6"]
+
+[project.urls]
+Homepage = "https://github.com/sirAlfry/retro-arcade-collection"
+
+# ---------------------------------------------------------------- tooling
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    # SDL's dummy video driver (used by the tests) has no GPU renderer
+    "ignore:no fast renderer available",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["tools/clean_game_ai.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I", "SIM"]
+ignore = [
+    "UP006",   # game_ai.py keeps typing.List/Dict for readability
+    "UP035",
+    "SIM108",  # explicit if/else reads better in game loops
+    "SIM105",  # try/except/pass is clearer than contextlib.suppress for beginners
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501", "E741"]   # X / O are the natural names in Tic Tac Toe tests
+"tools/*" = ["E501"]

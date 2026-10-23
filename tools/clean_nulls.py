@@ -10,11 +10,11 @@ Opzioni:
   --pattern / -p     : glob pattern (default: '*.py')
   --verbose / -v     : output più verboso
 """
-from pathlib import Path
-from datetime import datetime
 import argparse
-import sys
 import os
+from datetime import datetime
+from pathlib import Path
+
 
 def clean_file(path: Path, dry_run: bool = False, verbose: bool = False):
     try:

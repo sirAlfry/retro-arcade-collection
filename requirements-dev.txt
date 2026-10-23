@@ -1,0 +1,7 @@
+# Retro Arcade Collection — dipendenze per sviluppo, test e build
+-r requirements.txt
+
+pytest>=8.0       # test automatici (python -m pytest)
+ruff>=0.5         # linter + ordinamento import (ruff check .)
+pyinstaller>=6.0  # eseguibile standalone (packaging/RetroArcadeCollection.spec)
+pillow>=10.0      # solo per tools/make_icon.py (genera assets/icon.ico)

@@ -1,12 +1,31 @@
 # game_ai.py
-# Migliorato: robustezza, timeout controllato, protezione sugli stati esterni,
-# memoria efficiente, e strategie di ricerca avanzate
-import random
+"""
+Motore AI generico per giochi a turni a due giocatori (usato dal Tris).
+
+Algoritmi disponibili:
+    * ``random``     - mossa casuale
+    * ``heuristic``  - valuta solo la posizione dopo una mossa (greedy)
+    * ``minimax``    - minimax con iterative deepening e tabella di
+                       trasposizione (memo) se lo stato espone ``key()``
+    * ``alpha_beta`` - potatura alpha-beta con ordinamento delle mosse
+
+Novità della v3:
+    * a parità di valore la mossa viene scelta a caso (CPU meno prevedibile);
+    * ``blunder_rate``: probabilità di "sbagliare" apposta (difficoltà facili);
+    * l'iterative deepening usa solo le profondità completate entro il tempo
+      (prima una ricerca interrotta a metà poteva sovrascrivere la mossa buona);
+    * ``GameAI.for_level("easy" | "medium" | "hard")`` crea preset pronti;
+    * ``__slots__`` ora funziona davvero anche nelle sottoclassi di ``GameState``.
+"""
+from __future__ import annotations
+
 import copy
+import random
 import time
 from abc import ABC, abstractmethod
-from typing import List, Tuple, Any, Optional, Dict, Set
+from collections.abc import Hashable
 from enum import Enum
+from typing import Any, Dict, List, Tuple
 
 
 class AIAlgorithm(Enum):
@@ -28,13 +47,15 @@ class GameResult(Enum):
 class GameState(ABC):
     """Classe astratta per rappresentare lo stato di un gioco."""
 
+    __slots__ = ()  # permette alle sottoclassi di usare __slots__ davvero
+
     @abstractmethod
     def get_legal_moves(self) -> List[Any]:
         """Restituisce la lista delle mosse legali disponibili."""
         pass
 
     @abstractmethod
-    def make_move(self, move: Any) -> 'GameState':
+    def make_move(self, move: Any) -> GameState:
         """Esegue una mossa e restituisce il nuovo stato del gioco."""
         pass
 
@@ -58,9 +79,19 @@ class GameState(ABC):
         """Valuta la posizione corrente per il giocatore specificato."""
         pass
 
-    def copy(self) -> 'GameState':
+    def copy(self) -> GameState:
         """Crea una copia profonda dello stato di gioco."""
         return copy.deepcopy(self)
+
+    def key(self) -> Hashable | None:
+        """
+        Chiave hashable che identifica lo stato (opzionale).
+
+        Se restituisce un valore diverso da ``None`` il minimax memorizza i
+        risultati già calcolati (tabella di trasposizione), evitando di
+        rianalizzare la stessa posizione raggiunta con ordini di mosse diversi.
+        """
+        return None
 
 
 class GameAI:
@@ -71,7 +102,8 @@ class GameAI:
 
     __slots__ = (
         'algorithm', 'difficulty', 'time_limit', 'player_id',
-        'nodes_evaluated', 'start_time', '_best_move_by_depth'
+        'nodes_evaluated', 'start_time', 'blunder_rate', 'rng',
+        '_memo', '_aborted'
     )
 
     def __init__(
@@ -79,22 +111,26 @@ class GameAI:
         algorithm: str = "minimax",
         difficulty: int = 3,
         time_limit: float = 5.0,
-        player_id: int = -1
+        player_id: int = -1,
+        blunder_rate: float = 0.0,
+        rng: random.Random | None = None,
     ) -> None:
         """
         Inizializza l'AI del gioco.
 
         Args:
             algorithm: Algoritmo da utilizzare ('minimax', 'alpha_beta', 'random', 'heuristic')
-            difficulty: Profondità di ricerca (1-6)
+            difficulty: Profondità di ricerca (1-9)
             time_limit: Tempo massimo per trovare una mossa in secondi
             player_id: ID del giocatore AI
+            blunder_rate: Probabilità (0-1) di giocare una mossa casuale
+            rng: Generatore casuale (utile nei test per risultati ripetibili)
         """
         if isinstance(algorithm, AIAlgorithm):
             self.algorithm: AIAlgorithm = algorithm
         else:
             alg_str = str(algorithm).lower()
-            found: Optional[AIAlgorithm] = None
+            found: AIAlgorithm | None = None
             for alg in AIAlgorithm:
                 if alg.value == alg_str:
                     found = alg
@@ -107,14 +143,35 @@ class GameAI:
                 )
             self.algorithm = found
 
-        self.difficulty: int = max(1, min(6, difficulty))
+        self.difficulty: int = max(1, min(9, difficulty))
         self.time_limit: float = max(0.01, float(time_limit))
         self.player_id: int = player_id
+        self.blunder_rate: float = max(0.0, min(1.0, blunder_rate))
+        self.rng: random.Random = rng or random.Random()
         self.nodes_evaluated: int = 0
         self.start_time: float = 0.0
-        self._best_move_by_depth: Optional[Any] = None
+        self._memo: Dict[Any, float] = {}
+        self._aborted: bool = False
 
-    def get_best_move(self, state: GameState) -> Optional[Any]:
+    @classmethod
+    def for_level(cls, level: str, player_id: int = -1,
+                  rng: random.Random | None = None) -> GameAI:
+        """
+        Preset pronti all'uso.
+
+        * ``easy``   - euristica greedy che sbaglia una mossa su tre
+        * ``medium`` - minimax a profondità 2 con qualche errore
+        * ``hard``   - minimax completo: nel Tris è imbattibile
+        """
+        presets = {
+            "easy": dict(algorithm="heuristic", difficulty=1, blunder_rate=0.35),
+            "medium": dict(algorithm="minimax", difficulty=2, blunder_rate=0.12),
+            "hard": dict(algorithm="minimax", difficulty=9, blunder_rate=0.0),
+        }
+        cfg = presets.get(level, presets["medium"])
+        return cls(player_id=player_id, rng=rng, **cfg)  # type: ignore[arg-type]
+
+    def get_best_move(self, state: GameState) -> Any | None:
         """
         Calcola la miglior mossa per lo stato di gioco dato.
 
@@ -125,7 +182,7 @@ class GameAI:
             La miglior mossa trovata, o None se non disponibile
         """
         try:
-            legal_moves = state.get_legal_moves()
+            legal_moves = list(state.get_legal_moves())
         except Exception:
             return None
 
@@ -133,8 +190,12 @@ class GameAI:
             return None
 
         self.nodes_evaluated = 0
-        self.start_time = time.time()
-        self._best_move_by_depth = None
+        self.start_time = time.perf_counter()
+        self._memo = {}
+        self._aborted = False
+
+        if self.blunder_rate and self.rng.random() < self.blunder_rate:
+            return self.rng.choice(legal_moves)
 
         try:
             if self.algorithm == AIAlgorithm.RANDOM:
@@ -145,21 +206,29 @@ class GameAI:
                 return self._alpha_beta_move(state, legal_moves)
             elif self.algorithm == AIAlgorithm.HEURISTIC:
                 return self._heuristic_move(state, legal_moves)
-            return random.choice(legal_moves)
+            return self.rng.choice(legal_moves)
         except Exception:
             # fallback robusto
             try:
-                return random.choice(legal_moves)
+                return self.rng.choice(legal_moves)
             except Exception:
                 return None
 
     def _random_move(self, legal_moves: List[Any]) -> Any:
         """Seleziona una mossa casuale."""
-        return random.choice(legal_moves)
+        return self.rng.choice(legal_moves)
+
+    def _pick(self, scored: List[Tuple[float, Any]]) -> Any:
+        """Sceglie a caso tra le mosse con il valore massimo (tie-break)."""
+        best_value = max(v for v, _ in scored)
+        best = [m for v, m in scored if v >= best_value - 1e-9]
+        return self.rng.choice(best)
 
     def _minimax_move(self, state: GameState, legal_moves: List[Any]) -> Any:
         """
         Calcola la miglior mossa usando minimax con deepening iterativo.
+
+        Solo le profondità completate entro il tempo limite vengono usate.
 
         Args:
             state: Lo stato corrente del gioco
@@ -168,33 +237,31 @@ class GameAI:
         Returns:
             La miglior mossa trovata
         """
-        best_move: Optional[Any] = None
+        best_move: Any | None = None
         max_depth = max(1, self.difficulty)
+        # Se la profondità copre tutta la partita rimasta (come nel Tris, dove
+        # ogni mossa occupa una casella) basta una sola ricerca completa.
+        first_depth = max_depth if max_depth >= len(legal_moves) else 1
 
         # Deepening iterativo: prova profondità 1, 2, 3... fino a max_depth
-        for current_depth in range(1, max_depth + 1):
+        for current_depth in range(first_depth, max_depth + 1):
             if self._is_time_up():
                 break
-
-            depth_best_move: Optional[Any] = None
-            depth_best_value: float = float('-inf')
-
+            scored: List[Tuple[float, Any]] = []
             for move in legal_moves:
-                if self._is_time_up():
-                    break
                 try:
                     new_state = state.make_move(move)
-                    value = self._minimax(new_state, current_depth - 1, False)
-                    if value > depth_best_value:
-                        depth_best_value = value
-                        depth_best_move = move
+                    scored.append((self._minimax(new_state, current_depth - 1, False), move))
                 except Exception:
                     continue
+            if self._aborted:
+                break  # profondità incompleta: si tiene il risultato precedente
+            if scored:
+                best_move = self._pick(scored)
+            if all(abs(v) >= 1000 for v, _ in scored):
+                break  # esito già certo per ogni mossa: inutile scendere ancora
 
-            if depth_best_move is not None:
-                best_move = depth_best_move
-
-        return best_move if best_move is not None else random.choice(legal_moves)
+        return best_move if best_move is not None else self.rng.choice(legal_moves)
 
     def _alpha_beta_move(self, state: GameState, legal_moves: List[Any]) -> Any:
         """
@@ -207,7 +274,7 @@ class GameAI:
         Returns:
             La miglior mossa trovata
         """
-        best_move: Optional[Any] = None
+        best_move: Any | None = None
         max_depth = max(1, self.difficulty)
 
         # Deepening iterativo con ordinamento delle mosse
@@ -218,14 +285,12 @@ class GameAI:
             # Ordina le mosse per migliorare il pruning
             ordered_moves = self._order_moves(state, legal_moves)
 
-            depth_best_move: Optional[Any] = None
+            depth_best_move: Any | None = None
             depth_best_value: float = float('-inf')
             alpha: float = float('-inf')
             beta: float = float('inf')
 
             for move in ordered_moves:
-                if self._is_time_up():
-                    break
                 try:
                     new_state = state.make_move(move)
                     value = self._alpha_beta(new_state, current_depth - 1, alpha, beta, False)
@@ -236,10 +301,12 @@ class GameAI:
                 except Exception:
                     continue
 
+            if self._aborted:
+                break
             if depth_best_move is not None:
                 best_move = depth_best_move
 
-        return best_move if best_move is not None else random.choice(legal_moves)
+        return best_move if best_move is not None else self.rng.choice(legal_moves)
 
     def _heuristic_move(self, state: GameState, legal_moves: List[Any]) -> Any:
         """
@@ -252,20 +319,14 @@ class GameAI:
         Returns:
             La miglior mossa trovata
         """
-        best_move: Optional[Any] = None
-        best_value: float = float('-inf')
-
+        scored: List[Tuple[float, Any]] = []
         for move in legal_moves:
             try:
                 new_state = state.make_move(move)
-                value = new_state.evaluate_position(self.player_id)
-                if value > best_value:
-                    best_value = value
-                    best_move = move
+                scored.append((new_state.evaluate_position(self.player_id), move))
             except Exception:
                 continue
-
-        return best_move if best_move is not None else random.choice(legal_moves)
+        return self._pick(scored) if scored else self.rng.choice(legal_moves)
 
     def _order_moves(self, state: GameState, moves: List[Any]) -> List[Any]:
         """
@@ -307,7 +368,7 @@ class GameAI:
 
         Args:
             state: Lo stato da valutare
-            depth: Profondità attuale per favorire vittorie rapide
+            depth: Profondità rimanente: vincere prima vale di più
 
         Returns:
             Il valore della posizione
@@ -328,7 +389,7 @@ class GameAI:
 
     def _minimax(self, state: GameState, depth: int, maximizing: bool) -> float:
         """
-        Algoritmo minimax ricorsivo.
+        Algoritmo minimax ricorsivo con tabella di trasposizione opzionale.
 
         Args:
             state: Lo stato corrente del gioco
@@ -340,33 +401,31 @@ class GameAI:
         """
         self.nodes_evaluated += 1
 
-        if depth == 0 or state.is_terminal() or self._is_time_up():
+        if self._is_time_up():
+            self._aborted = True
+            return self._evaluate_terminal(state, depth)
+        if depth == 0 or state.is_terminal():
             return self._evaluate_terminal(state, depth)
 
-        if maximizing:
-            max_value: float = float('-inf')
-            for move in state.get_legal_moves():
-                try:
-                    new_state = state.make_move(move)
-                    value = self._minimax(new_state, depth - 1, False)
-                    max_value = max(max_value, value)
-                    if self._is_time_up():
-                        break
-                except Exception:
-                    continue
-            return max_value
-        else:
-            min_value: float = float('inf')
-            for move in state.get_legal_moves():
-                try:
-                    new_state = state.make_move(move)
-                    value = self._minimax(new_state, depth - 1, True)
-                    min_value = min(min_value, value)
-                    if self._is_time_up():
-                        break
-                except Exception:
-                    continue
-            return min_value
+        state_key = state.key()
+        memo_key = (state_key, depth, maximizing) if state_key is not None else None
+        if memo_key is not None and memo_key in self._memo:
+            return self._memo[memo_key]
+
+        values = []
+        for move in state.get_legal_moves():
+            try:
+                values.append(self._minimax(state.make_move(move), depth - 1, not maximizing))
+            except Exception:
+                continue
+            if self._aborted:
+                break
+        if not values:
+            return self._evaluate_terminal(state, depth)
+        result = max(values) if maximizing else min(values)
+        if memo_key is not None and not self._aborted:
+            self._memo[memo_key] = result
+        return result
 
     def _alpha_beta(
         self,
@@ -391,39 +450,40 @@ class GameAI:
         """
         self.nodes_evaluated += 1
 
-        if depth == 0 or state.is_terminal() or self._is_time_up():
+        if self._is_time_up():
+            self._aborted = True
+            return self._evaluate_terminal(state, depth)
+        if depth == 0 or state.is_terminal():
             return self._evaluate_terminal(state, depth)
 
         if maximizing:
             max_value: float = float('-inf')
-            for move in state.get_legal_moves():
+            for move in self._order_moves(state, state.get_legal_moves()):
                 try:
-                    new_state = state.make_move(move)
-                    value = self._alpha_beta(new_state, depth - 1, alpha, beta, False)
-                    max_value = max(max_value, value)
-                    alpha = max(alpha, value)
-                    if beta <= alpha or self._is_time_up():
-                        break
+                    value = self._alpha_beta(state.make_move(move), depth - 1, alpha, beta, False)
                 except Exception:
                     continue
+                max_value = max(max_value, value)
+                alpha = max(alpha, value)
+                if beta <= alpha or self._aborted:
+                    break
             return max_value
         else:
             min_value: float = float('inf')
-            for move in state.get_legal_moves():
+            for move in self._order_moves(state, state.get_legal_moves()):
                 try:
-                    new_state = state.make_move(move)
-                    value = self._alpha_beta(new_state, depth - 1, alpha, beta, True)
-                    min_value = min(min_value, value)
-                    beta = min(beta, value)
-                    if beta <= alpha or self._is_time_up():
-                        break
+                    value = self._alpha_beta(state.make_move(move), depth - 1, alpha, beta, True)
                 except Exception:
                     continue
+                min_value = min(min_value, value)
+                beta = min(beta, value)
+                if beta <= alpha or self._aborted:
+                    break
             return min_value
 
     def _is_time_up(self) -> bool:
         """Verifica se il tempo massimo è stato superato."""
-        return time.time() - self.start_time > self.time_limit
+        return time.perf_counter() - self.start_time > self.time_limit
 
     def get_stats(self) -> Dict[str, Any]:
         """
@@ -436,7 +496,7 @@ class GameAI:
             "algorithm": self.algorithm.value,
             "difficulty": self.difficulty,
             "nodes_evaluated": self.nodes_evaluated,
-            "time_taken": time.time() - self.start_time
+            "time_taken": time.perf_counter() - self.start_time
         }
 
 
@@ -450,7 +510,7 @@ class TicTacToeState(GameState):
 
     def __init__(
         self,
-        board: Optional[List[List[Optional[int]]]] = None,
+        board: List[List[int | None]] | None = None,
         current_player: int = 1
     ) -> None:
         """
@@ -461,7 +521,7 @@ class TicTacToeState(GameState):
             current_player: ID del giocatore corrente (1 o -1)
         """
         if board is None:
-            self.board: List[List[Optional[int]]] = [
+            self.board: List[List[int | None]] = [
                 [None for _ in range(3)] for _ in range(3)
             ]
         else:
@@ -469,7 +529,7 @@ class TicTacToeState(GameState):
             self.board = [row[:] for row in board]
 
         self.current_player: int = current_player
-        self._legal_moves_cache: Optional[List[Tuple[int, int]]] = None
+        self._legal_moves_cache: List[Tuple[int, int]] | None = None
         self._cache_valid: bool = False
 
     def __repr__(self) -> str:
@@ -512,10 +572,10 @@ class TicTacToeState(GameState):
         self._cache_valid = True
         return moves
 
-    def make_move(self, move: Tuple[int, int]) -> 'TicTacToeState':
+    def make_move(self, move: Tuple[int, int]) -> TicTacToeState:
         """
-        Esegue una mossa e restituisce il nuovo stato.
-        NOTA: Corregge il bug di shadowing della variabile 'row'.
+        Esegue una mossa e restituisce il nuovo stato (immutabilità: lo
+        stato corrente non viene modificato).
 
         Args:
             move: Tupla (riga, colonna) della mossa
@@ -524,7 +584,6 @@ class TicTacToeState(GameState):
             Nuovo stato di TicTacToe dopo la mossa
         """
         row_idx, col_idx = move
-        # CORRETTO: usa nomi di variabili diversi per evitare shadowing
         new_board = [row[:] for row in self.board]
         new_board[row_idx][col_idx] = self.current_player
         return TicTacToeState(new_board, -self.current_player)
@@ -563,7 +622,11 @@ class TicTacToeState(GameState):
         """Restituisce l'ID del giocatore corrente."""
         return self.current_player
 
-    def get_winner(self) -> Optional[int]:
+    def key(self) -> Tuple[Any, ...]:
+        """Chiave hashable per la tabella di trasposizione del minimax."""
+        return (tuple(tuple(row) for row in self.board), self.current_player)
+
+    def get_winner(self) -> int | None:
         """
         Determina se c'è un vincitore.
 
@@ -613,7 +676,7 @@ class TicTacToeState(GameState):
         score: float = 0.0
 
         # Valuta tutte le righe e colonne
-        lines: List[List[Optional[int]]] = []
+        lines: List[List[int | None]] = []
         for i in range(3):
             lines.append([self.board[i][j] for j in range(3)])
             lines.append([self.board[j][i] for j in range(3)])
@@ -637,7 +700,7 @@ class TicTacToeState(GameState):
 
         return score
 
-    def _evaluate_line(self, line: List[Optional[int]], player: int) -> float:
+    def _evaluate_line(self, line: List[int | None], player: int) -> float:
         """
         Valuta una linea (riga, colonna o diagonale).
 
