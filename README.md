@@ -175,14 +175,56 @@ I test usano i driver "dummy" di SDL (niente schermo né scheda audio), quindi n
 
 Consiglio: lancia `python -m pytest` e `ruff check .` prima di ogni commit, così ti accorgi subito se qualcosa si è rotto.
 
-## 📦 Build eseguibile
+## 📦 Creare l'eseguibile
+
+Con [PyInstaller](https://pyinstaller.org/en/stable/) puoi trasformare il progetto in **un unico file** che si avvia con un doppio clic, anche su un PC dove Python non è installato. La "ricetta" è già pronta in `packaging/RetroArcadeCollection.spec`: include tutti e 9 i giochi (che il launcher carica dinamicamente e PyInstaller da solo non troverebbe), l'icona e niente finestra nera del terminale.
+
+### Windows (PowerShell o Prompt dei comandi)
 
 ```bash
+# 1. Vai nella cartella del progetto
+cd C:\percorso\di\retro-arcade-collection
+
+# 2. (Se lo usi) attiva il virtual environment
+venv\Scripts\activate
+
+# 3. Installa gli strumenti di sviluppo (PyInstaller incluso)
 pip install -r requirements-dev.txt
-pyinstaller packaging/RetroArcadeCollection.spec
+
+# 4. Crea l'eseguibile
+pyinstaller --clean packaging\RetroArcadeCollection.spec
 ```
 
-Il file singolo `RetroArcadeCollection.exe` (o `RetroArcadeCollection` su Linux/macOS) compare in `dist/`. L'icona si rigenera con `python tools/make_icon.py`.
+Il risultato è **`dist\RetroArcadeCollection.exe`**: puoi copiarlo dove vuoi o condividerlo. L'opzione `--clean` svuota la cache di PyInstaller, utile quando rifai la build dopo aver modificato il codice.
+
+### macOS / Linux
+
+```bash
+cd percorso/di/retro-arcade-collection
+source venv/bin/activate          # se usi il virtual environment
+pip install -r requirements-dev.txt
+pyinstaller --clean packaging/RetroArcadeCollection.spec
+```
+
+Il risultato è `dist/RetroArcadeCollection`.
+
+### Da sapere
+
+- **Si crea sul sistema di destinazione**: PyInstaller non è un cross-compiler. Per avere un `.exe` va lanciato su Windows; per macOS su un Mac; per Linux su Linux.
+- **Le cartelle `build/` e `dist/`** create da PyInstaller sono già escluse dal `.gitignore`.
+- **Primo avvio un po' lento** (qualche secondo): l'eseguibile "a file singolo" si scompatta ogni volta in una cartella temporanea. È normale.
+- **Record e impostazioni**: `scores.json` viene creato accanto all'eseguibile. Se l'eseguibile sta in una cartella protetta (es. `C:\Program Files`), il gioco usa automaticamente `%APPDATA%\RetroArcadeCollection`.
+- **Avviso di Windows SmartScreen** ("Windows ha protetto il PC"): succede con tutti gli eseguibili non firmati digitalmente. Clic su *Ulteriori informazioni* → *Esegui comunque*. La ricetta disattiva la compressione UPX proprio per ridurre i falsi allarmi degli antivirus.
+- **Icona**: è `assets/icon.ico`. Se modifichi la navicella in `game_shared.make_icon()`, rigenerala con `python tools/make_icon.py`.
+
+### Se qualcosa va storto
+
+| Problema | Soluzione |
+|---|---|
+| `pyinstaller` non è riconosciuto come comando | Usa `python -m PyInstaller --clean packaging/RetroArcadeCollection.spec` oppure controlla di aver attivato il venv |
+| L'eseguibile si chiude subito o un gioco non parte | Controlla `retro_arcade.log` accanto all'eseguibile; se hai aggiunto un nuovo gioco, aggiungi il suo modulo alla lista `GAMES` nella spec |
+| Dopo una modifica al codice l'eseguibile è "vecchio" | Rifai la build con `--clean` |
+| L'antivirus mette l'eseguibile in quarantena | È un falso positivo tipico dei programmi impacchettati: aggiungi un'eccezione o segnalalo come falso positivo al produttore dell'antivirus |
 
 ## 📖 Game Design Document
 
