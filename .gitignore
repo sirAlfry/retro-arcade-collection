@@ -11,6 +11,7 @@ __pycache__/
 
 # --- Distribution / packaging (la spec PyInstaller vive in packaging/) ---
 build/
+dist/
 *.egg-info/
 *.egg
 MANIFEST
